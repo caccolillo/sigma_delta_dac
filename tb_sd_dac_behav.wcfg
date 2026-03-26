@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<wave_config>
+   <wave_state>
+   </wave_state>
+   <db_ref_list>
+      <db_ref path="tb_sd_dac_behav.wdb" id="1">
+         <top_modules>
+            <top_module name="glbl" />
+            <top_module name="tb_sd_dac" />
+         </top_modules>
+      </db_ref>
+   </db_ref_list>
+   <zoom_setting>
+      <ZoomStartTime time="401.202961666 ms"></ZoomStartTime>
+      <ZoomEndTime time="409.402961667 ms"></ZoomEndTime>
+      <Cursor1Time time="408.036295000 ms"></Cursor1Time>
+   </zoom_setting>
+   <column_width_setting>
+      <NameColumnWidth column_width="358"></NameColumnWidth>
+      <ValueColumnWidth column_width="159"></ValueColumnWidth>
+   </column_width_setting>
+   <WVObjectSize size="5" />
+   <wvobject type="logic" fp_name="/tb_sd_dac/u_sd_dac/clk">
+      <obj_property name="ElementShortName">clk</obj_property>
+      <obj_property name="ObjectShortName">clk</obj_property>
+   </wvobject>
+   <wvobject type="logic" fp_name="/tb_sd_dac/u_sd_dac/rst">
+      <obj_property name="ElementShortName">rst</obj_property>
+      <obj_property name="ObjectShortName">rst</obj_property>
+   </wvobject>
+   <wvobject type="logic" fp_name="/tb_sd_dac/u_sd_dac/samp_valid">
+      <obj_property name="ElementShortName">samp_valid</obj_property>
+      <obj_property name="ObjectShortName">samp_valid</obj_property>
+   </wvobject>
+   <wvobject type="array" fp_name="/tb_sd_dac/u_sd_dac/din">
+      <obj_property name="ElementShortName">din[12:0]</obj_property>
+      <obj_property name="ObjectShortName">din[12:0]</obj_property>
+      <obj_property name="WaveformStyle">STYLE_ANALOG</obj_property>
+      <obj_property name="CellHeight">100</obj_property>
+   </wvobject>
+   <wvobject type="logic" fp_name="/tb_sd_dac/u_sd_dac/dout">
+      <obj_property name="ElementShortName">dout</obj_property>
+      <obj_property name="ObjectShortName">dout</obj_property>
+   </wvobject>
+</wave_config>

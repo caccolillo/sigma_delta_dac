@@ -1,30 +1,5 @@
 # =============================================================================
-# plot_dac.py  (v8 - hardware matched)
-# Post-processing script for sigma-delta DAC simulation.
-#
-# Models the EXACT analogue reconstruction filter on the board:
-#
-#   Signal chain:
-#     FPGA dout
-#       -> 33 ohm series resistor  (modelled as wire, negligible at audio)
-#       -> HPF: R=5.6kohm, C=100nF, unity-gain op-amp buffer  (fc=284 Hz)
-#       -> LPF stage 1: R=4.7kohm, C=10nF, unity-gain buffer  (fc=3386 Hz)
-#       -> LPF stage 2: Sallen-Key, R1=R2=4.7kohm, C1=C2=10nF,
-#                       Rg=Rf=10kohm (gain K=2, Q=1)           (fc=3386 Hz)
-#       -> Vout
-#
-#   All three stages are modelled as bilinear-transform IIR filters derived
-#   from the exact component values, NOT from a generic Butterworth prototype.
-#   This means the simulation reflects what you will actually measure on the
-#   board with those specific E24 resistor and C0G capacitor values.
-#
-#   The phase shift shown in the plot is REAL — it is what the op-amp filter
-#   will impose on the signal. For a voice band DAC this is perfectly normal
-#   and acceptable. The FFT panel is the primary quality indicator: a clean
-#   single spike at the signal frequency with >60dB rejection at 10x fc.
-#
-# Usage: python3 plot_dac.py
-# Dependencies: pip install pandas numpy scipy matplotlib
+# plot_dac.py  (v11 - matched to 500ms dwell, 2048-pt FFT)
 # =============================================================================
 
 import pandas as pd
@@ -32,364 +7,231 @@ import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
-import sys
-import os
+import sys, os
 
-# ── Configuration ─────────────────────────────────────────────────────────────
-CSV_FILE        = "pdm_output.csv"
-PNG_FILE        = "dac_reconstruction.png"
-CLK_FREQ        = 100e6
-FS              = CLK_FREQ
-F_SIGNAL        = 1000.0       # Hz — match FREQ_HZ in sine_gen.v
-SKIP_MS         = 5.0          # discard modulator startup transient
-ZOOM_MS         = 10.0         # waveform panel window length
-DECIMATE_STAGES = [5, 5, 5]    # 100MHz->20MHz->4MHz->800kHz (avoids FIR ringing)
-N_FFT           = 65536
+CSV_FILE  = "pdm_output.csv"
+PNG_FILE  = "dac_sweep.png"
+FS_SAMP   = 8000.0
+SKIP_MS   = 20.0          # skip first 20ms of each segment (filter settle)
+N_FFT     = 2048          # fits within 4000 - 160 = 3840 remaining samples
 
-# ── Exact board component values ──────────────────────────────────────────────
-# HPF stage
-R_HPF   = 5.6e3                # 5.6 kohm (E24)
-C_HPF   = 100e-9               # 100 nF   (C0G)
-FC_HPF  = 1 / (2 * np.pi * R_HPF * C_HPF)   # 284.2 Hz
+R_HPF, C_HPF = 5.6e3, 100e-9
+R_LPF, C_LPF = 3.9e3,  10e-9
+R_SK,  C_SK  = 3.9e3,  10e-9
+K_SK         = 2.0
 
-# LPF stage 1 (1st order RC + unity gain buffer)
-R_LPF1  = 4.7e3                # 4.7 kohm (E24)
-C_LPF1  = 10e-9                # 10 nF    (C0G)
-FC_LPF1 = 1 / (2 * np.pi * R_LPF1 * C_LPF1) # 3386 Hz
+FREQ_TABLE = [
+    (0, 312.5,  "300 Hz"),
+    (1, 500.0,  "500 Hz"),
+    (2, 812.5,  "800 Hz"),
+    (3, 1000.0, "1 kHz"),
+    (4, 1500.0, "1.5 kHz"),
+    (5, 2000.0, "2 kHz"),
+    (6, 2500.0, "2.5 kHz"),
+    (7, 3000.0, "3 kHz"),
+    (8, 3406.3, "3.4 kHz"),
+]
 
-# LPF stage 2 (Sallen-Key, equal R equal C, K=2 -> Q=1)
-R_SK    = 4.7e3                # R1 = R2
-C_SK    = 10e-9                # C1 = C2
-K_SK    = 2.0                  # gain = 1 + Rf/Rg = 1 + 10k/10k
-# For equal-R equal-C Sallen-Key:
-#   omega0 = 1/(R*C),  Q = 1/(3-K)
-OMEGA0_SK = 1 / (R_SK * C_SK)
-Q_SK      = 1 / (3 - K_SK)    # = 1.0 for K=2
-FC_SK     = OMEGA0_SK / (2 * np.pi)  # 3386 Hz
-# ─────────────────────────────────────────────────────────────────────────────
+def build_filters(fs):
+    tau_h = R_HPF * C_HPF
+    tau_l = R_LPF * C_LPF
+    w0    = 1.0 / (R_SK * C_SK)
+    bh, ah  = signal.bilinear([tau_h, 0], [tau_h, 1], fs=fs)
+    bl, al  = signal.bilinear([1], [tau_l, 1], fs=fs)
+    bs, as_ = signal.bilinear([K_SK*w0**2], [1,(3-K_SK)*w0,w0**2], fs=fs)
+    return (bh, ah), (bl, al), (bs, as_)
 
-def check_csv(path):
-    if not os.path.exists(path):
-        print(f"ERROR: {path} not found.")
-        sys.exit(1)
-    print(f"  CSV file       : {path}  ({os.path.getsize(path)/1e6:.1f} MB)")
-
-def auto_convert_time(t_raw):
-    last = t_raw[-1]
-    if last > 1e10:
-        print(f"  Time column    : picoseconds -> seconds")
-        return t_raw * 1e-12
-    elif last > 1e7:
-        print(f"  Time column    : nanoseconds -> seconds")
-        return t_raw * 1e-9
-    else:
-        print(f"  Time column    : microseconds -> seconds")
-        return t_raw * 1e-6
-
-def staged_decimate(data, stages):
+def apply_filters(data, filt):
     out = data.copy()
-    fs_cur = FS
-    for i, factor in enumerate(stages):
-        fs_cur /= factor
-        out = signal.decimate(out, factor, ftype='fir', zero_phase=True)
-        print(f"  Stage {i+1}: /{factor} -> {fs_cur/1e3:.0f} kHz  "
-              f"({len(out):,} samples)")
-    return out, fs_cur
-
-def build_hardware_filters(fs_d):
-    """
-    Build bilinear-transform IIR filters from exact component values.
-    Each stage is derived independently so you can swap components and
-    immediately see the effect on the simulated frequency response.
-    """
-    # ── HPF: 1st order RC ─────────────────────────────────────────────────────
-    # Analogue prototype: H(s) = s*tau / (1 + s*tau),  tau = R*C
-    tau_hpf = R_HPF * C_HPF
-    # Bilinear transform: s = 2*fs*(z-1)/(z+1)
-    b_hpf, a_hpf = signal.bilinear(
-        [tau_hpf, 0],           # numerator:   tau*s
-        [tau_hpf, 1],           # denominator: tau*s + 1
-        fs=fs_d
-    )
-
-    # ── LPF stage 1: 1st order RC ─────────────────────────────────────────────
-    # Analogue prototype: H(s) = 1 / (1 + s*tau)
-    tau_lpf1 = R_LPF1 * C_LPF1
-    b_lpf1, a_lpf1 = signal.bilinear(
-        [1],
-        [tau_lpf1, 1],
-        fs=fs_d
-    )
-
-    # ── LPF stage 2: Sallen-Key 2nd order ────────────────────────────────────
-    # Analogue prototype for equal-R equal-C Sallen-Key with gain K:
-    # H(s) = K*omega0^2 / (s^2 + (3-K)*omega0*s + omega0^2)
-    # With K=2, Q=1: H(s) = 2*omega0^2 / (s^2 + omega0*s + omega0^2)
-    w0 = OMEGA0_SK
-    b_sk, a_sk = signal.bilinear(
-        [K_SK * w0**2],                  # numerator
-        [1, (3 - K_SK) * w0, w0**2],     # denominator: s^2 + (3-K)*w0*s + w0^2
-        fs=fs_d
-    )
-
-    return (b_hpf, a_hpf), (b_lpf1, a_lpf1), (b_sk, a_sk)
-
-def apply_hardware_filters(data, filters):
-    hpf, lpf1, sk = filters
-    out = signal.lfilter(*hpf,  data)
-    out = signal.lfilter(*lpf1, out)
-    out = signal.lfilter(*sk,   out)
+    for b, a in filt:
+        out = signal.lfilter(b, a, out)
     return out
 
-def filter_frequency_response(filters, fs_d, n_points=4096):
-    """Combined frequency response of the full analogue filter chain."""
-    freqs = np.fft.rfftfreq(n_points * 2, d=1.0 / fs_d)[:n_points]
-    H_combined = np.ones(n_points, dtype=complex)
-    for b, a in filters:
-        _, H = signal.freqz(b, a, worN=freqs, fs=fs_d)
-        H_combined *= H
-    db = 20 * np.log10(np.abs(H_combined) + 1e-12)
-    db -= db[:10].mean()   # normalise to passband
-    phase_deg = np.degrees(np.unwrap(np.angle(H_combined)))
-    return freqs, db, phase_deg
+def measure_all(data, fs, f_sig, n_fft=N_FFT, n_harmonics=5):
+    n    = min(n_fft, len(data))
+    win  = np.hanning(n)
+    spec = np.abs(np.fft.rfft(data[:n] * win)) * 2.0 / win.sum()
+    pwr  = spec**2
+    freq = np.fft.rfftfreq(n, d=1.0/fs)
+    bw   = freq[1]
 
-def compute_fft(data, fs, n_fft):
-    n     = min(n_fft, len(data))
-    win   = np.hanning(n)
-    spec  = np.abs(np.fft.rfft(data[:n] * win))
-    freqs = np.fft.rfftfreq(n, d=1.0 / fs)
-    db    = 20 * np.log10(spec / (spec.max() + 1e-12) + 1e-12)
-    return freqs, db
+    sig_b    = int(round(f_sig / bw))
+    sig_b    = np.clip(sig_b, 1, len(pwr)-1)
+    sig_bins = set(range(max(1, sig_b-2), min(len(pwr), sig_b+3)))
 
-def find_phase_offset(reconstructed, t, f_signal, fs_d):
-    """Brute-force phase search over one period."""
-    period_samples = int(round(fs_d / f_signal))
-    seg  = reconstructed[:period_samples]
-    seg  = seg / (np.max(np.abs(seg)) + 1e-12)
-    t_seg = np.arange(period_samples) / fs_d
-    best_phi, best_score = 0.0, -np.inf
-    for phi in np.linspace(-np.pi, np.pi, 2000):
-        score = np.dot(seg, np.sin(2 * np.pi * f_signal * t_seg + phi))
-        if score > best_score:
-            best_score, best_phi = score, phi
+    harm_bins = set()
+    for h in range(2, n_harmonics+1):
+        hb = int(round(f_sig * h / bw))
+        if hb < len(pwr):
+            for b in range(max(1,hb-1), min(len(pwr),hb+2)):
+                harm_bins.add(b)
+
+    vb_set    = set(np.where((freq >= 200) & (freq <= 4000))[0].tolist())
+    sig_pwr   = sum(pwr[b] for b in sig_bins)
+    harm_pwr  = sum(pwr[b] for b in harm_bins if b in vb_set)
+    noise_pwr = sum(pwr[b] for b in vb_set if b not in sig_bins and b not in harm_bins)
+    total_nd  = harm_pwr + noise_pwr
+
+    sinad = 10*np.log10(sig_pwr / (total_nd  + 1e-30))
+    snr   = 10*np.log10(sig_pwr / (noise_pwr + 1e-30))
+    thd   = 10*np.log10(harm_pwr / (sig_pwr  + 1e-30))
+    enob  = (sinad - 1.76) / 6.02
+    db    = 20*np.log10(spec / (spec.max()+1e-12) + 1e-12)
+    return sinad, snr, thd, enob, freq, db
+
+def align_phase(sig, fs, f):
+    n   = min(int(round(fs/f)), len(sig))
+    seg = sig[:n] / (np.max(np.abs(sig[:n]))+1e-12)
+    t   = np.arange(n)/fs
+    best_phi, best = 0.0, -np.inf
+    for phi in np.linspace(-np.pi, np.pi, 500):
+        s = np.dot(seg, np.sin(2*np.pi*f*t+phi))
+        if s > best: best, best_phi = s, phi
     return best_phi
 
-# ── Load CSV ──────────────────────────────────────────────────────────────────
+# ── Load ──────────────────────────────────────────────────────────────────────
 print("Loading CSV...")
-check_csv(CSV_FILE)
-df   = pd.read_csv(CSV_FILE)
-pdm  = df["dout"].to_numpy(dtype=np.float64)
-t_ns = df["time_ns"].to_numpy(dtype=np.float64)
-t_s  = auto_convert_time(t_ns)
-print(f"  Samples loaded : {len(pdm):,}  |  Duration: {t_s[-1]*1e3:.2f} ms")
+if not os.path.exists(CSV_FILE):
+    print(f"ERROR: {CSV_FILE} not found"); sys.exit(1)
+df    = pd.read_csv(CSV_FILE)
+t_raw = df["time_ns"].to_numpy(dtype=np.float64)
+last  = t_raw[-1]
+t_s   = t_raw * (1e-12 if last>1e10 else 1e-9 if last>1e7 else 1e-6)
+print(f"  Rows: {len(df):,}  |  Duration: {t_s[-1]:.2f} s")
+print(f"  Samples per segment (est): {len(df)//9:,}")
 
-# ── Staged decimation ─────────────────────────────────────────────────────────
-total_factor = 1
-for s in DECIMATE_STAGES:
-    total_factor *= s
-print(f"\nDecimating {FS/1e6:.0f} MHz -> {FS/total_factor/1e3:.0f} kHz ...")
-pdm_d, fs_d = staged_decimate(pdm, DECIMATE_STAGES)
-t_s_d = t_s[::total_factor][:len(pdm_d)]
+filters  = build_filters(FS_SAMP)
+SKIP_S   = int(SKIP_MS * 1e-3 * FS_SAMP)
 
-# ── Build and apply hardware-matched filters ──────────────────────────────────
-print(f"\nBuilding hardware-matched filters at {fs_d/1e3:.0f} kHz ...")
-print(f"  HPF  fc = {FC_HPF:.1f} Hz  (R={R_HPF/1e3:.1f}k, C={C_HPF*1e9:.0f}nF)")
-print(f"  LPF1 fc = {FC_LPF1:.1f} Hz  (R={R_LPF1/1e3:.1f}k, C={C_LPF1*1e9:.0f}nF)")
-print(f"  SK   fc = {FC_SK:.1f} Hz  (R={R_SK/1e3:.1f}k, C={C_SK*1e9:.0f}nF, "
-      f"K={K_SK:.0f}, Q={Q_SK:.2f})")
+results = []
+print(f"\n  {'Freq':>8}  {'SINAD':>7}  {'ENOB':>6}  {'SNR':>7}  {'THD':>7}  {'N':>5}")
+print(f"  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*7}  {'-'*7}  {'-'*5}")
 
-filters = build_hardware_filters(fs_d)
-print("Applying filters...")
-filtered = apply_hardware_filters(pdm_d, filters)
+for idx, f_actual, f_label in FREQ_TABLE:
+    seg = df[df["freq_idx"] == idx]["din"].to_numpy(dtype=np.float64)
+    needed = SKIP_S + N_FFT
+    if len(seg) < needed:
+        print(f"  {f_label:>8}  (skipped — {len(seg)} samples, need {needed})")
+        continue
 
-# ── Skip transient ────────────────────────────────────────────────────────────
-SKIP          = int(SKIP_MS * 1e-3 * fs_d)
-flt_plot      = filtered[SKIP:]
-t_plot        = t_s_d[SKIP:]
-flt_max       = np.max(np.abs(flt_plot)) + 1e-12
-flt_plot_norm = flt_plot / flt_max
+    filt_seg = apply_filters(seg, filters)[SKIP_S:]
+    filt_seg = filt_seg / (np.max(np.abs(filt_seg))+1e-12)
 
-# ── Display decimation ────────────────────────────────────────────────────────
-DEC_PLOT     = max(1, int(fs_d / 80e3))
-t_dec        = t_plot[::DEC_PLOT]
-flt_dec_norm = flt_plot_norm[::DEC_PLOT]
-fs_disp      = fs_d / DEC_PLOT
+    sinad, snr, thd, enob, freq, fft_db = measure_all(filt_seg, FS_SAMP, f_actual)
+    phi = align_phase(filt_seg, FS_SAMP, f_actual)
 
-# ── Phase alignment ───────────────────────────────────────────────────────────
-print("\nFinding phase offset...")
-best_phi = find_phase_offset(flt_dec_norm, t_dec, F_SIGNAL, fs_disp)
-print(f"  Phase offset   : {np.degrees(best_phi):.1f} deg at {F_SIGNAL:.0f} Hz")
-print(f"  (This is the real phase shift introduced by the op-amp filter)")
-ideal_full = np.sin(2 * np.pi * F_SIGNAL * (t_dec - t_dec[0]) + best_phi)
+    print(f"  {f_label:>8}  {sinad:>7.1f}  {enob:>6.2f}  {snr:>7.1f}  {thd:>7.1f}  {len(seg):>5}")
+    results.append(dict(idx=idx, f=f_actual, label=f_label,
+                        filtered=filt_seg, freq=freq, fft_db=fft_db,
+                        sinad=sinad, snr=snr, thd=thd, enob=enob, phi=phi))
 
-# ── Zoom window ───────────────────────────────────────────────────────────────
-zoom_mask  = t_dec <= (t_dec[0] + ZOOM_MS * 1e-3)
-t_zoom_ms  = (t_dec[zoom_mask] - t_dec[0]) * 1e3
-flt_zoom   = flt_dec_norm[zoom_mask]
-ideal_zoom = ideal_full[zoom_mask]
-
-# ── FFT ───────────────────────────────────────────────────────────────────────
-print("Computing FFT...")
-sig_freqs, sig_fft_db = compute_fft(flt_plot, fs_d, N_FFT)
-
-# ── Filter frequency and phase response ──────────────────────────────────────
-fr_freqs, fr_db, fr_phase = filter_frequency_response(filters, fs_d)
-
-# ── Raw PDM zoom ──────────────────────────────────────────────────────────────
-Z0 = int(SKIP_MS * 1e-3 * FS)
-ZN = int(0.1e-3 * FS)
-t_raw_zoom    = t_s[Z0 : Z0 + ZN]
-pdm_raw_zoom  = pdm[Z0 : Z0 + ZN]
-t_raw_zoom_us = (t_raw_zoom - t_raw_zoom[0]) * 1e6
-
-# ── Measure key filter attenuation points ─────────────────────────────────────
-def attn_at(f, freqs, db):
-    return db[np.argmin(np.abs(freqs - f))]
-
-a_8k   = attn_at(8000,  fr_freqs, fr_db)
-a_34k  = attn_at(34000, fr_freqs, fr_db)
-a_3k4  = attn_at(3400,  fr_freqs, fr_db)
-a_300  = attn_at(300,   fr_freqs, fr_db)
-ph_1k  = fr_phase[np.argmin(np.abs(fr_freqs - F_SIGNAL))]
+if not results:
+    print("ERROR: no segments processed")
+    print(f"Segment sizes: { {i: (df['freq_idx']==i).sum() for i in range(9)} }")
+    sys.exit(1)
 
 # ── Plot ──────────────────────────────────────────────────────────────────────
-print("Plotting...")
-fig = plt.figure(figsize=(15, 14))
+print("\nPlotting...")
+n   = len(results)
+col = plt.cm.viridis(np.linspace(0.15, 0.85, n))
+
+fig = plt.figure(figsize=(17, 15))
 fig.suptitle(
-    f"Sigma-Delta DAC — hardware-matched analogue filter model\n"
-    f"HPF {FC_HPF:.0f} Hz + LPF {FC_LPF1:.0f} Hz (3rd order Butterworth Sallen-Key)  |  "
-    f"{F_SIGNAL:.0f} Hz sine  |  100 MHz / 8 kHz",
-    fontsize=12, fontweight='bold', y=0.99
-)
-gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.58, wspace=0.35)
+    "Sigma-Delta DAC — G.711 voice band sweep\n"
+    "4th-order MASH 1-1-1-1  |  Bresenham interpolation  |  PRBS dither  |  "
+    "100 MHz / 8 kHz  |  LPF fc = 4.08 kHz  (R=3.9 kΩ, C=10 nF)",
+    fontsize=11, fontweight='bold', y=0.995)
 
-# Panel 1: Raw PDM
-ax1 = fig.add_subplot(gs[0, :])
-ax1.plot(t_raw_zoom_us, pdm_raw_zoom,
-         color='#378ADD', linewidth=0.6, drawstyle='steps-post')
-ax1.set_title("Raw 1-bit PDM output (0.1 ms window)", fontweight='bold')
-ax1.set_xlabel("Time (µs)")
-ax1.set_ylabel("PDM bit")
-ax1.set_yticks([0, 1])
-ax1.set_ylim(-0.25, 1.25)
-ax1.grid(True, alpha=0.3)
-ax1.set_facecolor('#FAFAFA')
+gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.60, wspace=0.38)
 
-# Panel 2: Reconstructed waveform
-ax2 = fig.add_subplot(gs[1, :])
-ax2.plot(t_zoom_ms, flt_zoom,
-         color='#1D9E75', linewidth=1.5, label='Reconstructed output', zorder=3)
-ax2.plot(t_zoom_ms, ideal_zoom,
-         color='#D85A30', linewidth=1.0, linestyle='--', alpha=0.85,
-         label=f'Ideal {F_SIGNAL:.0f} Hz (phase-aligned to output)', zorder=2)
-ax2.set_title(
-    f"Reconstructed output — {ZOOM_MS:.0f} ms / "
-    f"{int(F_SIGNAL * ZOOM_MS / 1000)} cycles  |  "
-    f"filter phase = {ph_1k:.1f}° at {F_SIGNAL:.0f} Hz  "
-    f"(real hardware phase shift)",
-    fontweight='bold')
-ax2.set_xlabel("Time (ms)")
-ax2.set_ylabel("Amplitude (normalised)")
-ax2.set_xlim(0, ZOOM_MS)
-ax2.legend(loc='upper right', fontsize=9)
-ax2.grid(True, alpha=0.3)
-ax2.set_facecolor('#FAFAFA')
+for i, r in enumerate(results[:9]):
+    row, c = divmod(i, 3)
+    ax = fig.add_subplot(gs[row, c])
+    n_show = min(int(5 * FS_SAMP / r["f"]), len(r["filtered"]))
+    t_ms   = np.arange(n_show) / FS_SAMP * 1e3
+    sig    = r["filtered"][:n_show]
+    ideal  = np.sin(2*np.pi*r["f"]*np.arange(n_show)/FS_SAMP + r["phi"])
+    ax.plot(t_ms, sig,   color=col[i], linewidth=1.3, zorder=3, label='Output')
+    ax.plot(t_ms, ideal, color='#D85A30', linewidth=0.8,
+            linestyle='--', alpha=0.65, zorder=2, label='Ideal')
+    ax.set_title(
+        f"{r['label']}  SINAD {r['sinad']:.0f} dB  ENOB {r['enob']:.1f} b",
+        fontsize=8.5, fontweight='bold')
+    ax.set_xlabel("Time (ms)", fontsize=7.5)
+    ax.set_ylabel("Amplitude", fontsize=7.5)
+    ax.set_ylim(-1.3, 1.3)
+    ax.set_xlim(0, t_ms[-1])
+    ax.tick_params(labelsize=7)
+    ax.grid(True, alpha=0.3)
+    ax.set_facecolor('#FAFAFA')
 
-# Panel 3a: Filter magnitude response
-ax3 = fig.add_subplot(gs[2, 0])
-ax3.plot(fr_freqs / 1e3, fr_db, color='#534AB7', linewidth=1.3)
-ax3.axvline(300  / 1e3, color='#E24B4A', linestyle=':', linewidth=1,
-            label=f'HPF {FC_HPF:.0f} Hz ({a_300:.1f} dB)')
-ax3.axvline(3400 / 1e3, color='#E24B4A', linestyle='--', linewidth=1,
-            label=f'LPF {FC_LPF1:.0f} Hz ({a_3k4:.1f} dB)')
-ax3.axvline(8000 / 1e3, color='#BA7517', linestyle='--', linewidth=1,
-            label=f'8 kHz ({a_8k:.1f} dB)')
-# Mark component-accurate -3dB points
-for fc, label in [(FC_HPF, 'HPF -3dB'), (FC_LPF1, 'LPF -3dB')]:
-    ax3.axhline(-3, color='gray', linestyle=':', linewidth=0.8)
-ax3.set_title("Filter magnitude response (from component values)",
-              fontweight='bold')
-ax3.set_xlabel("Frequency (kHz)")
-ax3.set_ylabel("Magnitude (dB)")
-ax3.set_xlim(0, 20)
-ax3.set_ylim(-100, 5)
-ax3.legend(fontsize=8)
-ax3.grid(True, alpha=0.3)
-ax3.set_facecolor('#FAFAFA')
+ax_m = fig.add_subplot(gs[3, 0:2])
+f_v     = [r["f"]     for r in results]
+sinad_v = [r["sinad"] for r in results]
+snr_v   = [r["snr"]   for r in results]
+thd_v   = [r["thd"]   for r in results]
+enob_v  = [r["enob"]  for r in results]
 
-# Panel 3b: Filter phase response
-ax4 = fig.add_subplot(gs[2, 1])
-mask_ph = fr_freqs <= 8000
-ax4.plot(fr_freqs[mask_ph] / 1e3, fr_phase[mask_ph],
-         color='#D85A30', linewidth=1.3)
-ax4.axvline(F_SIGNAL / 1e3, color='#1D9E75', linestyle='-', linewidth=1,
-            label=f'{F_SIGNAL:.0f} Hz: {ph_1k:.1f}°')
-ax4.axvline(300  / 1e3, color='#E24B4A', linestyle=':', linewidth=1,
-            label='HPF 300 Hz')
-ax4.axvline(3400 / 1e3, color='#E24B4A', linestyle='--', linewidth=1,
-            label='LPF 3.4 kHz')
-ax4.set_title("Filter phase response (IIR — non-linear, real hardware)",
-              fontweight='bold')
-ax4.set_xlabel("Frequency (kHz)")
-ax4.set_ylabel("Phase (degrees)")
-ax4.set_xlim(0, 8)
-ax4.legend(fontsize=8)
-ax4.grid(True, alpha=0.3)
-ax4.set_facecolor('#FAFAFA')
+ax_m.plot(f_v, sinad_v, color='#1D9E75', marker='o', linewidth=1.8,
+          markersize=6, label='SINAD (dB)', zorder=4)
+ax_m.plot(f_v, snr_v,   color='#378ADD', marker='s', linewidth=1.3,
+          markersize=5, linestyle='--', label='SNR (dB)', zorder=3)
+ax_m.plot(f_v, thd_v,   color='#D85A30', marker='^', linewidth=1.3,
+          markersize=5, linestyle=':', label='THD (dBc)', zorder=3)
+ax_m.axhline(-60, color='#534AB7', linewidth=0.8, linestyle='--',
+             alpha=0.5, label='–60 dB ref')
+ax_m.axvspan(300, 3400, alpha=0.06, color='#1D9E75')
+for f, s in zip(f_v, sinad_v):
+    ax_m.annotate(f'{s:.0f}', (f, s),
+                  textcoords="offset points", xytext=(0,7),
+                  fontsize=7.5, ha='center', color='#1D9E75', fontweight='bold')
+ax_m.set_title("SINAD, SNR and THD vs frequency", fontweight='bold')
+ax_m.set_xlabel("Frequency (Hz)")
+ax_m.set_ylabel("dB")
+ax_m.set_xscale('log')
+ax_m.set_xlim(250, 4500)
+ax_m.legend(fontsize=8.5, loc='lower left')
+ax_m.grid(True, alpha=0.3, which='both')
+ax_m.set_facecolor('#FAFAFA')
 
-# Panel 4a: Output spectrum — voice band
-ax5 = fig.add_subplot(gs[3, 0])
-mask_vb = sig_freqs <= 8000
-ax5.plot(sig_freqs[mask_vb] / 1e3, sig_fft_db[mask_vb],
-         color='#534AB7', linewidth=1.1)
-ax5.axvline(300      / 1e3, color='#E24B4A', linestyle=':',  linewidth=1.2,
-            label=f'HPF {FC_HPF:.0f} Hz')
-ax5.axvline(3400     / 1e3, color='#E24B4A', linestyle='--', linewidth=1.2,
-            label=f'LPF {FC_LPF1:.0f} Hz')
-ax5.axvline(F_SIGNAL / 1e3, color='#1D9E75', linestyle='-',  linewidth=1.2,
-            label=f'Signal {F_SIGNAL:.0f} Hz')
-ax5.set_title("Output spectrum — voice band (0 – 8 kHz)", fontweight='bold')
-ax5.set_xlabel("Frequency (kHz)")
-ax5.set_ylabel("Magnitude (dB)")
-ax5.set_ylim(-120, 5)
-ax5.legend(fontsize=8)
-ax5.grid(True, alpha=0.3)
-ax5.set_facecolor('#FAFAFA')
-
-# Panel 4b: Output spectrum — full
-ax6 = fig.add_subplot(gs[3, 1])
-ax6.plot(sig_freqs / 1e3, sig_fft_db, color='#534AB7', linewidth=0.7)
-ax6.axvline(3400 / 1e3, color='#E24B4A', linestyle='--', linewidth=1.2,
-            label=f'LPF {FC_LPF1:.0f} Hz')
-ax6.set_title(f"Output spectrum — full (0 – {fs_d/2/1e3:.0f} kHz)",
-              fontweight='bold')
-ax6.set_xlabel("Frequency (kHz)")
-ax6.set_ylabel("Magnitude (dB)")
-ax6.set_ylim(-120, 5)
-ax6.legend(fontsize=8)
-ax6.grid(True, alpha=0.3)
-ax6.set_facecolor('#FAFAFA')
+ax_e = fig.add_subplot(gs[3, 2])
+ax_e.plot(f_v, enob_v, color='#534AB7', marker='D', linewidth=1.8,
+          markersize=6, zorder=4)
+ax_e.axhline(13, color='#E24B4A', linewidth=1, linestyle='--', label='13-bit target')
+ax_e.axvspan(300, 3400, alpha=0.06, color='#1D9E75')
+for f, e in zip(f_v, enob_v):
+    ax_e.annotate(f'{e:.1f}', (f, e),
+                  textcoords="offset points", xytext=(0,7),
+                  fontsize=7.5, ha='center', color='#534AB7', fontweight='bold')
+ax_e.set_title("ENOB vs frequency", fontweight='bold')
+ax_e.set_xlabel("Frequency (Hz)")
+ax_e.set_ylabel("Effective bits")
+ax_e.set_xscale('log')
+ax_e.set_xlim(250, 4500)
+ax_e.legend(fontsize=8.5)
+ax_e.grid(True, alpha=0.3, which='both')
+ax_e.set_facecolor('#FAFAFA')
 
 plt.savefig(PNG_FILE, dpi=150, bbox_inches='tight')
-print(f"\nPlot saved to {PNG_FILE}")
+print(f"Plot saved to {PNG_FILE}")
 plt.show()
 
-# ── Console summary ───────────────────────────────────────────────────────────
-voice_mask = sig_freqs <= 8000
-peak_freq  = sig_freqs[voice_mask][np.argmax(sig_fft_db[voice_mask])]
-
-print("\n── Hardware filter summary ───────────────────────")
-print(f"  HPF  R={R_HPF/1e3:.1f}k C={C_HPF*1e9:.0f}nF  fc={FC_HPF:.1f} Hz")
-print(f"  LPF1 R={R_LPF1/1e3:.1f}k C={C_LPF1*1e9:.0f}nF  fc={FC_LPF1:.1f} Hz")
-print(f"  SK   R={R_SK/1e3:.1f}k C={C_SK*1e9:.0f}nF  fc={FC_SK:.1f} Hz  "
-      f"K={K_SK:.0f}  Q={Q_SK:.2f}")
-print(f"\n── Signal quality ────────────────────────────────")
-print(f"  Signal peak            : {peak_freq:.1f} Hz  (expected {F_SIGNAL:.0f} Hz)")
-print(f"  Phase at {F_SIGNAL:.0f} Hz     : {ph_1k:.1f} deg  (real hardware phase)")
-print(f"  Filter at 300 Hz       : {a_300:.1f} dB")
-print(f"  Filter at 3.4 kHz      : {a_3k4:.1f} dB")
-print(f"  Filter at 8 kHz        : {a_8k:.1f} dB")
-print(f"  Filter at 34 kHz       : {a_34k:.1f} dB  (10x fc)")
-print(f"  PDM clock              : {FS/1e6:.0f} MHz")
-print(f"  OSR                    : {int(FS / (2 * 3400))}")
-print("─────────────────────────────────────────────────")
+print("\n── Filter component change ───────────────────────────")
+for label, r in [("Old (4.7 kOhm)", 4.7e3), ("New (3.6 kOhm)", 3.6e3)]:
+    fc_val = 1/(2*np.pi*r*10e-9)
+    a34 = 20*np.log10(1/np.sqrt(1+(3400/fc_val)**2))
+    a8k = 20*np.log10(1/np.sqrt(1+(8000/fc_val)**2))
+    print(f"  {label}  fc={fc_val:.0f} Hz  @3.4kHz={a34:.1f} dB  @8kHz={a8k:.1f} dB")
+print("──────────────────────────────────────────────────────")
+print("\n── Voice band SINAD summary ──────────────────────────")
+print(f"  {'Freq':>8}  {'SINAD':>7}  {'ENOB':>6}  {'SNR':>7}  {'THD':>8}")
+print(f"  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*7}  {'-'*8}")
+for r in results:
+    print(f"  {r['label']:>8}  {r['sinad']:>6.1f} dB"
+          f"  {r['enob']:>5.2f} b"
+          f"  {r['snr']:>6.1f} dB"
+          f"  {r['thd']:>7.1f} dBc")
+if results:
+    print(f"\n  Worst-case SINAD : {min(r['sinad'] for r in results):.1f} dB")
+    print(f"  Worst-case ENOB  : {min(r['enob']  for r in results):.2f} bits")
+print("──────────────────────────────────────────────────────")

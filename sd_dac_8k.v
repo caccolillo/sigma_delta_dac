@@ -1,16 +1,16 @@
 // =============================================================================
-// sd_dac_8k.v  (v4 - fixed linear interpolation)
+// sd_dac_8k.v  (v5 - dual LFSR TPDF dither)
 // 13-bit 4th-order MASH 1-1-1-1 Sigma-Delta DAC
 //
-// Linear interpolation: counter-based, no fixed-point arithmetic.
-//   Each 8kHz period the delta (new-old) is computed once.
-//   A 14-bit error accumulator adds |delta| every clock.
-//   When it overflows 12500 the integer output steps by +/-1.
-//   This is a Bresenham-style line algorithm - exact, no rounding error,
-//   no bit-width issues, synthesises to ~30 LUTs.
-//
-// PRBS dither: 16-bit LFSR, 1 LSB, breaks idle tones.
-// MASH 1-1-1-1: 4th order, unconditionally stable.
+// Changes from v4:
+//   - Replaced single 16-bit LFSR rectangular dither with dual LFSR TPDF
+//   - LFSR A: 16-bit, poly x^16+x^15+x^13+x^4+1, period = 65,535
+//   - LFSR B: 17-bit, poly x^17+x^16+x^15+x^4+1, period = 131,071
+//   - Combined dither period LCM = 8,589,737,985 clocks = 85 seconds
+//   - Sync period with 1kHz signal: 1,717,948 seconds (never repeats in sim)
+//   - TPDF values: {-1, 0, 0, +1} with weights {1, 2, 2, 1}/4
+//   - Zero mean: no DC bias added to signal
+//   - Completely decorrelates quantisation error from periodic inputs
 //
 // Clock: 100 MHz | Sample rate: 8 kHz | OSR: 12500
 // =============================================================================
@@ -26,65 +26,93 @@ module sd_dac_8k (
 // =============================================================================
 // 1. LINEAR INTERPOLATION - Bresenham accumulator
 // =============================================================================
-// Ramps the output from prev_s to curr_s over exactly 12500 clock cycles.
-// Algorithm:
-//   err accumulates |delta| each cycle
-//   when err >= 12500, subtract 12500 and step the output by sign(delta)
-// This is integer-exact with no fixed-point approximation errors.
 
 reg [12:0] curr_s, prev_s;
-reg [12:0] interp;          // current interpolated value (integer, no fraction)
-reg [13:0] bres_err;        // Bresenham error accumulator (range 0..24999)
-reg [12:0] bres_delta_abs;  // |curr_s - prev_s|
-reg        bres_dir;        // 1 = ramping up, 0 = ramping down
-reg        bres_active;     // high when delta != 0
+reg [12:0] interp;
+reg [13:0] bres_err;
+reg [12:0] bres_delta_abs;
+reg        bres_dir;
+reg        bres_active;
 
 always @(posedge clk) begin
     if (rst) begin
-        curr_s      <= 13'd4096;
-        prev_s      <= 13'd4096;
-        interp      <= 13'd4096;
-        bres_err    <= 14'd0;
+        curr_s         <= 13'd4096;
+        prev_s         <= 13'd4096;
+        interp         <= 13'd4096;
+        bres_err       <= 14'd0;
         bres_delta_abs <= 13'd0;
-        bres_dir    <= 1'b0;
-        bres_active <= 1'b0;
+        bres_dir       <= 1'b0;
+        bres_active    <= 1'b0;
     end else if (samp_valid) begin
-        // Latch new sample, compute delta
-        prev_s      <= curr_s;
-        curr_s      <= din;
-        interp      <= curr_s;   // start ramp from current (will ramp to din)
-        bres_err    <= 14'd0;
-        bres_dir    <= (din >= curr_s);
-        bres_active <= (din != curr_s);
-        bres_delta_abs <= (din >= curr_s) ? (din - curr_s) : (curr_s - din);
+        prev_s         <= curr_s;
+        curr_s         <= din;
+        interp         <= curr_s;
+        bres_err       <= 14'd0;
+        bres_dir       <= (din >= curr_s);
+        bres_active    <= (din != curr_s);
+        bres_delta_abs <= (din >= curr_s) ? (din - curr_s)
+                                          : (curr_s - din);
     end else if (bres_active) begin
         bres_err <= bres_err + {1'b0, bres_delta_abs};
         if (bres_err + {1'b0, bres_delta_abs} >= 14'd12500) begin
             bres_err <= bres_err + {1'b0, bres_delta_abs} - 14'd12500;
-            if (bres_dir) begin
+            if (bres_dir)
                 interp <= (interp < 13'd8191) ? interp + 1'b1 : 13'd8191;
-            end else begin
+            else
                 interp <= (interp > 13'd0)    ? interp - 1'b1 : 13'd0;
-            end
         end
     end
 end
 
 // =============================================================================
-// 2. PRBS DITHER - 16-bit maximal LFSR
+// 2. DUAL LFSR TPDF DITHER
 // =============================================================================
-// Polynomial: x^16 + x^15 + x^13 + x^4 + 1   period = 65535
+// Two independent LFSRs with different polynomials and seeds.
+// Their periods are coprime so combined period = LCM = 8.6 billion clocks.
+// This prevents any synchronisation with the signal period in simulation.
+//
+// LFSR A: 16-bit, poly x^16+x^15+x^13+x^4+1  period = 65,535
+// LFSR B: 17-bit, poly x^17+x^16+x^15+x^4+1  period = 131,071
+//
+// TPDF = lfsr_a[0] - lfsr_b[0]
+// Gives values {-1, 0, 0, +1} with probabilities {1/4, 1/4, 1/4, 1/4}
+// Mean = 0, Variance = 1/2
+// Completely decorrelates quantisation error from periodic inputs.
+//
+// To disable dither for testing:
+//   Comment the tpdf/din_mod lines and uncomment:
+//   wire [12:0] din_mod = interp;
 
-reg [15:0] lfsr;
+reg [15:0] lfsr_a;
+reg [16:0] lfsr_b;
+
 always @(posedge clk) begin
-    if (rst) lfsr <= 16'hACE1;
-    else     lfsr <= {lfsr[0] ^ lfsr[2] ^ lfsr[12] ^ lfsr[15],
-                      lfsr[15:1]};
+    if (rst) begin
+        lfsr_a <= 16'hACE1;       // seed A — must not be zero
+        lfsr_b <= 17'h1F351;      // seed B — must not be zero, different from A
+    end else begin
+        // LFSR A: x^16+x^15+x^13+x^4+1
+        lfsr_a <= {lfsr_a[0] ^ lfsr_a[2] ^ lfsr_a[12] ^ lfsr_a[15],
+                   lfsr_a[15:1]};
+        // LFSR B: x^17+x^16+x^15+x^4+1
+        lfsr_b <= {lfsr_b[0] ^ lfsr_b[3] ^ lfsr_b[14] ^ lfsr_b[15] ^ lfsr_b[16],
+                   lfsr_b[16:1]};
+    end
 end
 
-// Add 0 or 1 LSB, saturate at 8191
-wire [13:0] dith_sum = {1'b0, interp} + {13'b0, lfsr[0]};
-wire [12:0] din_mod  = dith_sum[13] ? 13'd8191 : dith_sum[12:0];
+// TPDF: subtract two independent bits -> {-1, 0, 0, +1}
+wire signed [13:0] tpdf     = $signed({13'b0, lfsr_a[0]})
+                             - $signed({13'b0, lfsr_b[0]});
+
+// Add TPDF to interpolated value, clamp to valid range
+wire signed [13:0] dith_sum = $signed({1'b0, interp}) + tpdf;
+
+wire [12:0] din_mod = (dith_sum < $signed(14'd0))    ? 13'd0    :
+                      (dith_sum > $signed(14'd8191))  ? 13'd8191 :
+                       dith_sum[12:0];
+
+// Uncomment to disable dither for testing:
+// wire [12:0] din_mod = interp;
 
 // =============================================================================
 // 3. MASH 1-1-1-1

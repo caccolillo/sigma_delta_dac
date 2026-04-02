@@ -126,6 +126,8 @@ endfunction
 
 reg [1:0] phase;        // 0..3 output phase counter
 reg       running;      // high while outputting the 4 samples
+reg signed [31:0] acc;
+reg signed [31:0] result;
 
 reg [13:0] sr_capture [0:7];  // captured shift register at samp_valid time
 
@@ -146,7 +148,6 @@ always @(posedge clk) begin
             running <= 1'b1;
         end else if (running) begin
             // Output one interpolated sample per clock until all 4 done
-            reg signed [31:0] acc;
             case (phase)
                 2'd0: acc = branch_mac(
                     sr_capture[0], sr_capture[1], sr_capture[2], sr_capture[3],
@@ -167,7 +168,6 @@ always @(posedge clk) begin
             endcase
 
             // Right-shift by 14 (coefficient scale factor), clamp to 13-bit
-            reg signed [31:0] result;
             result = acc >>> 14;
 
             if      (result < 32'sd0)    dout <= 13'd0;

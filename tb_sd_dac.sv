@@ -22,14 +22,21 @@ module tb_sd_dac;
         .freq_idx     (freq_idx)
     );
 
-    sd_dac_8k u_sd_dac (
+//    sd_dac_8k u_sd_dac (
+//        .clk        (clk),
+//        .rst        (rst),
+//        .samp_valid (sample_valid),
+//        .din        (sample),
+//        .dout       (dout)
+//    );
+    
+    top u_top (
         .clk        (clk),
         .rst        (rst),
-        .samp_valid (sample_valid),
-        .din        (sample),
         .dout       (dout)
     );
-
+    
+    
     initial clk = 0;
     always #5 clk = ~clk;
 

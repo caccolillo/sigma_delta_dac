@@ -44,7 +44,7 @@ set_property -name "webtalk.xsim_launch_sim" -value "142" -objects $obj
 
 #add simulation sources
 set_property SOURCE_SET sources_1 [get_filesets sim_1]
-add_files -fileset sim_1 -norecurse ./sd_dac_8k.v ./sine_gen.v ./tb_sd_dac.sv ./top.v
+add_files -fileset sim_1 -norecurse ./sd_dac_8k.v ./sine_gen.v ./tb_sd_dac.sv ./top.v ./interp4x.v
 
 #add design sources
 #add_files -norecurse {./clocked_comparator_25bit.vhd ./mux2to1_32bit.vhd ./sinewave_generator.vhd}

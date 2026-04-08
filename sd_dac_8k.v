@@ -24,7 +24,9 @@ module sd_dac_8k (
 
 reg [12:0] curr_s, prev_s;
 reg [12:0] interp;
-reg [11:0] bres_err;        // 12-bit: range 0..6249 (< 2*3125)
+// bres_err max value = (divider-1) + max_delta = 3124 + 8191 = 11315
+// Needs 14 bits (2^14-1 = 16383 > 11315). Do NOT reduce below 14 bits.
+reg [13:0] bres_err;
 reg [12:0] bres_delta_abs;
 reg        bres_dir;
 reg        bres_active;
@@ -34,7 +36,7 @@ always @(posedge clk) begin
         curr_s         <= 13'd4096;
         prev_s         <= 13'd4096;
         interp         <= 13'd4096;
-        bres_err       <= 12'd0;
+        bres_err       <= 14'd0;
         bres_delta_abs <= 13'd0;
         bres_dir       <= 1'b0;
         bres_active    <= 1'b0;
@@ -42,20 +44,20 @@ always @(posedge clk) begin
         prev_s         <= curr_s;
         curr_s         <= din;
         interp         <= curr_s;
-        bres_err       <= 12'd0;
+        bres_err       <= 14'd0;
         bres_dir       <= (din >= curr_s);
         bres_active    <= (din != curr_s);
         bres_delta_abs <= (din >= curr_s) ? (din - curr_s)
                                           : (curr_s - din);
     end else if (bres_active) begin
-        if (bres_err + {1'b0, bres_delta_abs[11:0]} >= 12'd3125) begin
-            bres_err <= bres_err + bres_delta_abs[11:0] - 12'd3125;
+        // Full 14-bit addition — no truncation of bres_delta_abs
+        bres_err <= bres_err + {1'b0, bres_delta_abs};
+        if (bres_err + {1'b0, bres_delta_abs} >= 14'd3125) begin
+            bres_err <= bres_err + {1'b0, bres_delta_abs} - 14'd3125;
             if (bres_dir)
                 interp <= (interp < 13'd8191) ? interp + 1'b1 : 13'd8191;
             else
                 interp <= (interp > 13'd0)    ? interp - 1'b1 : 13'd0;
-        end else begin
-            bres_err <= bres_err + bres_delta_abs[11:0];
         end
     end
 end

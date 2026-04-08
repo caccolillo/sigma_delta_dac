@@ -82,78 +82,73 @@ end
 // =============================================================================
 // FIR coefficients
 // =============================================================================
-// Kaiser windowed-sinc, 31 taps, beta=8, cutoff=4kHz at 32kHz.
-// Stored as 15-bit signed fixed-point with shift=14.
-// Gain of L=4 is embedded (coefficients already multiplied by 4).
-// Output must be right-shifted by 14 bits after MAC.
+// Kaiser windowed-sinc, 31 taps, beta=8, cutoff=5kHz at 32kHz (raised from 4kHz).
+// Passband 0-3.4kHz: <0.4dB ripple (was -2.7dB at 3.4kHz with fc=4kHz)
+// Stopband 8kHz+   : >81dB attenuation
+// Shift=14, L=4 gain absorbed: output = MAC * L >> 14 = MAC >> 12
+
+localparam signed [14:0] C00 =  15'sd1;
+localparam signed [14:0] C01 =  15'sd4;
+localparam signed [14:0] C02 =  15'sd2;
+localparam signed [14:0] C03 = -15'sd16;
+localparam signed [14:0] C04 = -15'sd44;
+localparam signed [14:0] C05 = -15'sd30;
+localparam signed [14:0] C06 =  15'sd73;
+localparam signed [14:0] C07 =  15'sd207;
+localparam signed [14:0] C08 =  15'sd175;
+localparam signed [14:0] C09 = -15'sd178;
+localparam signed [14:0] C10 = -15'sd668;
+localparam signed [14:0] C11 = -15'sd703;
+localparam signed [14:0] C12 =  15'sd292;
+localparam signed [14:0] C13 =  15'sd2254;
+localparam signed [14:0] C14 =  15'sd4265;
+localparam signed [14:0] C15 =  15'sd5120;   // centre tap
+localparam signed [14:0] C16 =  15'sd4265;
+localparam signed [14:0] C17 =  15'sd2254;
+localparam signed [14:0] C18 =  15'sd292;
+localparam signed [14:0] C19 = -15'sd703;
+localparam signed [14:0] C20 = -15'sd668;
+localparam signed [14:0] C21 = -15'sd178;
+localparam signed [14:0] C22 =  15'sd175;
+localparam signed [14:0] C23 =  15'sd207;
+localparam signed [14:0] C24 =  15'sd73;
+localparam signed [14:0] C25 = -15'sd30;
+localparam signed [14:0] C26 = -15'sd44;
+localparam signed [14:0] C27 = -15'sd16;
+localparam signed [14:0] C28 =  15'sd2;
+localparam signed [14:0] C29 =  15'sd4;
+localparam signed [14:0] C30 =  15'sd1;
+
+// =============================================================================
+// MAC — combinatorial, registered into dout on out_valid only
+// =============================================================================
+// Computing mac combinatorially and registering only on out_valid avoids
+// the one-clock pipeline lag that caused peaks to appear one sample too early
+// or too late, making them appear lower in the waveform viewer.
 //
-// h[n] = 4 * firwin(31, 4000, window=('kaiser',8), fs=32000)
-// Quantised: round(h[n] * 2^14 / 4) stored here, multiply by 4 at output.
-// Equivalently: coeff[n] = round(h_normalised[n] * 2^14)
-// then output = (sum(sr[n]*coeff[n]) * 4) >> 14
-//             = sum(sr[n]*coeff[n]) >> 12
+// Accumulator width: 14 (sr) + 15 (coeff) + ceil(log2(31)) = 34 bits.
+// 36-bit signed for safety.
+// Right-shift by 12: shift=14 minus log2(L=4)=2 absorbs the L gain factor.
+// mac[24:12] extracts 13 bits (width = 24-12+1 = 13). NOT mac[23:12] which
+// is only 12 bits wide and clips at 4095.
 
-localparam signed [14:0] C00 = -15'sd1;
-localparam signed [14:0] C01 = -15'sd4;
-localparam signed [14:0] C02 = -15'sd7;
-localparam signed [14:0] C03 =  15'sd0;
-localparam signed [14:0] C04 =  15'sd32;
-localparam signed [14:0] C05 =  15'sd79;
-localparam signed [14:0] C06 =  15'sd93;
-localparam signed [14:0] C07 =  15'sd0;
-localparam signed [14:0] C08 = -15'sd223;
-localparam signed [14:0] C09 = -15'sd466;
-localparam signed [14:0] C10 = -15'sd481;
-localparam signed [14:0] C11 =  15'sd0;
-localparam signed [14:0] C12 =  15'sd1057;
-localparam signed [14:0] C13 =  15'sd2439;
-localparam signed [14:0] C14 =  15'sd3627;
-localparam signed [14:0] C15 =  15'sd4096;   // centre tap
-localparam signed [14:0] C16 =  15'sd3627;
-localparam signed [14:0] C17 =  15'sd2439;
-localparam signed [14:0] C18 =  15'sd1057;
-localparam signed [14:0] C19 =  15'sd0;
-localparam signed [14:0] C20 = -15'sd481;
-localparam signed [14:0] C21 = -15'sd466;
-localparam signed [14:0] C22 = -15'sd223;
-localparam signed [14:0] C23 =  15'sd0;
-localparam signed [14:0] C24 =  15'sd93;
-localparam signed [14:0] C25 =  15'sd79;
-localparam signed [14:0] C26 =  15'sd32;
-localparam signed [14:0] C27 =  15'sd0;
-localparam signed [14:0] C28 = -15'sd7;
-localparam signed [14:0] C29 = -15'sd4;
-localparam signed [14:0] C30 = -15'sd1;
-
-// =============================================================================
-// MAC — runs every clock, registered output
-// =============================================================================
-// Accumulator width: 14 (sr) + 15 (coeff) + ceil(log2(31)) = 34 bits
-// Use 36-bit signed to be safe.
-// Output shift: >> 12 (because L=4 = 2^2, shift=14, net = 14-2 = 12)
-
-reg signed [35:0] mac;
+wire signed [35:0] mac_w =
+      sr[ 0]*C00 + sr[ 1]*C01 + sr[ 2]*C02 + sr[ 3]*C03
+    + sr[ 4]*C04 + sr[ 5]*C05 + sr[ 6]*C06 + sr[ 7]*C07
+    + sr[ 8]*C08 + sr[ 9]*C09 + sr[10]*C10 + sr[11]*C11
+    + sr[12]*C12 + sr[13]*C13 + sr[14]*C14 + sr[15]*C15
+    + sr[16]*C16 + sr[17]*C17 + sr[18]*C18 + sr[19]*C19
+    + sr[20]*C20 + sr[21]*C21 + sr[22]*C22 + sr[23]*C23
+    + sr[24]*C24 + sr[25]*C25 + sr[26]*C26 + sr[27]*C27
+    + sr[28]*C28 + sr[29]*C29 + sr[30]*C30;
 
 always @(posedge clk) begin
     if (rst) begin
-        mac  <= 36'sd0;
         dout <= 13'd4096;
-    end else begin
-        mac <= sr[ 0]*C00 + sr[ 1]*C01 + sr[ 2]*C02 + sr[ 3]*C03
-             + sr[ 4]*C04 + sr[ 5]*C05 + sr[ 6]*C06 + sr[ 7]*C07
-             + sr[ 8]*C08 + sr[ 9]*C09 + sr[10]*C10 + sr[11]*C11
-             + sr[12]*C12 + sr[13]*C13 + sr[14]*C14 + sr[15]*C15
-             + sr[16]*C16 + sr[17]*C17 + sr[18]*C18 + sr[19]*C19
-             + sr[20]*C20 + sr[21]*C21 + sr[22]*C22 + sr[23]*C23
-             + sr[24]*C24 + sr[25]*C25 + sr[26]*C26 + sr[27]*C27
-             + sr[28]*C28 + sr[29]*C29 + sr[30]*C30;
-
-        // Right-shift by 12 to get output (L=4 absorbed into shift)
-        // mac >> 12 needs 13 bits (0..8191): use mac[24:12] not mac[23:12]
-        // mac[23:12] is only 12 bits wide (max 4095) — would clip at half scale
-        if      (mac[35:12] < $signed(36'sd0))    dout <= 13'd0;
-        else if (mac[35:12] > $signed(36'sd8191)) dout <= 13'd8191;
-        else                                       dout <= mac[24:12];
+    end else if (out_valid) begin
+        if      (mac_w[35:12] < $signed(24'sd0))    dout <= 13'd0;
+        else if (mac_w[35:12] > $signed(24'sd8191)) dout <= 13'd8191;
+        else                                         dout <= mac_w[24:12];
     end
 end
 

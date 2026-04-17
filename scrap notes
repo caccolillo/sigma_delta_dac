@@ -1,78 +1,61 @@
 module sd_dac_8k (
-    input  wire        clk,
-    input  wire        rst,
-    input  wire        samp_valid,
-    input  wire [12:0] din,        // Unsigned 13-bit [0 to 8191]
-    output reg         dout
+    input  wire        clk,        // 100 MHz
+    input  wire        rst,        // active-high
+    input  wire        samp_valid, // 8 kHz pulse
+    input  wire [12:0] din,        // 0 to 8191
+    output reg         dout        // PDM out
 );
 
-localparam integer MOD_DIV = 49;
+// --- Clock Enable (2.04 MHz) ---
+reg [5:0] cnt;
+reg       ce;
+always @(posedge clk) begin
+    if (rst) begin cnt <= 0; ce <= 0; end
+    else if (cnt == 48) begin cnt <= 0; ce <= 1; end
+    else begin cnt <= cnt + 1; ce <= 0; end
+end
 
-// --- STABILITY PARAMETERS ---
-// We scale feedback to be exactly the same as the input range.
-// For a 13-bit input, the range is 8192. 
-// Using FB=8192 and LIMIT=16384 is the most stable configuration.
-localparam signed [31:0] FB    = 32'sd8192; 
-localparam signed [31:0] LIMIT = 32'sd16384; 
+// --- Signed Input Logic ---
+// We convert 13-bit unsigned to 16-bit signed.
+// Range: -4096 to +4095
+reg signed [15:0] x;
+always @(posedge clk) begin
+    if (rst) x <= 0;
+    else if (samp_valid) x <= $signed({1'b0, din}) - 16'sd4096;
+end
 
-reg [5:0]  mod_cnt;
-reg        mod_clk_en;
-reg signed [31:0] x_in;
+// --- Modulator ---
+// Using 32-bit integrators for high precision.
+// FB is 8192, which is 2x the max input (Safe stability index).
 reg signed [31:0] i1, i2;
-
-// 1. Clock Divider (2.04 MHz)
-always @(posedge clk) begin
-    if (rst) begin
-        mod_cnt <= 0;
-        mod_clk_en <= 0;
-    end else if (mod_cnt == MOD_DIV - 1) begin
-        mod_cnt <= 0;
-        mod_clk_en <= 1;
-    end else begin
-        mod_cnt <= mod_cnt + 1;
-        mod_clk_en <= 0;
-    end
-end
-
-// 2. Input Conversion (Offset Binary to Signed)
-always @(posedge clk) begin
-    if (rst) begin
-        x_in <= 0;
-    end else if (samp_valid) begin
-        // Force 'din' to be treated as a positive value before subtracting
-        // 4096 is the "Zero" point.
-        // Result: din=0 -> -4096, din=4096 -> 0, din=8191 -> +4095
-        x_in <= $signed({1'b0, din}) - 32'sd4096;
-    end
-end
-
-// 3. Modulator Logic
-// The feedback is subtracted from BOTH stages to ensure 2nd-order stability.
-wire signed [31:0] fb_val = (dout) ? FB : -FB;
-
-// intermediate sums (33-bit to prevent intermediate overflow)
-wire signed [32:0] next_i1 = i1 + (x_in - fb_val);
-wire signed [32:0] next_i2 = i2 + (i1 - fb_val); // note: using i1, not next_i1 for timing
+localparam signed [31:0] FB = 32'sd8192; 
+localparam signed [31:0] LIM = 32'sd16384; // Clamp
 
 always @(posedge clk) begin
     if (rst) begin
         i1   <= 0;
         i2   <= 0;
         dout <= 0;
-    end else if (mod_clk_en) begin
+    end else if (ce) begin
+        // Use the current dout to decide the feedback for this cycle
+        // If we just output a 1, we subtract FB. If 0, we add FB.
+        automatic signed [31:0] fb_val = dout ? FB : -FB;
         
-        // Integrator 1 with Clamping
-        if (next_i1 > LIMIT)       i1 <= LIMIT;
-        else if (next_i1 < -LIMIT) i1 <= -LIMIT;
-        else                       i1 <= next_i1[31:0];
+        // --- Integrator 1 ---
+        // New i1 = i1 + error
+        // Clamping to LIM prevents wind-up
+        if      (i1 + (x - fb_val) >  LIM) i1 <=  LIM;
+        else if (i1 + (x - fb_val) < -LIM) i1 <= -LIM;
+        else                               i1 <= i1 + (x - fb_val);
 
-        // Integrator 2 with Clamping
-        if (next_i2 > LIMIT)       i2 <= LIMIT;
-        else if (next_i2 < -LIMIT) i2 <= -LIMIT;
-        else                       i2 <= next_i2[31:0];
+        // --- Integrator 2 ---
+        // New i2 = i2 + (i1_delayed - fb_val)
+        if      (i2 + (i1 - fb_val) >  LIM) i2 <=  LIM;
+        else if (i2 + (i1 - fb_val) < -LIM) i2 <= -LIM;
+        else                                i2 <= i2 + (i1 - fb_val);
 
-        // Quantizer (Bitstream Output)
-        // If i2 is positive, we output 1 to push the next error negative
+        // --- Decision (Quantizer) ---
+        // If the accumulated error in i2 is positive, output a 1
         dout <= (i2 >= 0);
     end
 end

@@ -2,26 +2,25 @@ module sd_dac_8k (
     input  wire        clk,
     input  wire        rst,
     input  wire        samp_valid,
-    input  wire [12:0] din,
+    input  wire [12:0] din,        // Unsigned 13-bit [0 to 8191]
     output reg         dout
 );
 
 localparam integer MOD_DIV = 49;
 
-// --- MATH SETUP ---
-// Input din is 0 to 8191. 
-// We center it: -4096 to +4095.
-// We set Feedback (FB) to 8192. This 50% ratio is the "Sweet Spot" 
-// for 2nd order stability.
+// --- STABILITY PARAMETERS ---
+// We scale feedback to be exactly the same as the input range.
+// For a 13-bit input, the range is 8192. 
+// Using FB=8192 and LIMIT=16384 is the most stable configuration.
 localparam signed [31:0] FB    = 32'sd8192; 
-localparam signed [31:0] LIMIT = 32'sd16384; // Very tight limit = instant recovery
+localparam signed [31:0] LIMIT = 32'sd16384; 
 
 reg [5:0]  mod_cnt;
 reg        mod_clk_en;
 reg signed [31:0] x_in;
 reg signed [31:0] i1, i2;
 
-// 1. Clock Divider
+// 1. Clock Divider (2.04 MHz)
 always @(posedge clk) begin
     if (rst) begin
         mod_cnt <= 0;
@@ -35,19 +34,25 @@ always @(posedge clk) begin
     end
 end
 
-// 2. Input Latch
+// 2. Input Conversion (Offset Binary to Signed)
 always @(posedge clk) begin
-    if (rst) x_in <= 0;
-    else if (samp_valid) x_in <= $signed({1'b0, din}) - 32'sd4096;
+    if (rst) begin
+        x_in <= 0;
+    end else if (samp_valid) begin
+        // Force 'din' to be treated as a positive value before subtracting
+        // 4096 is the "Zero" point.
+        // Result: din=0 -> -4096, din=4096 -> 0, din=8191 -> +4095
+        x_in <= $signed({1'b0, din}) - 32'sd4096;
+    end
 end
 
-// 3. The Modulator (The "Magic" Logic)
-// Standard 2nd order requires feedback to be subtracted from BOTH stages.
+// 3. Modulator Logic
+// The feedback is subtracted from BOTH stages to ensure 2nd-order stability.
 wire signed [31:0] fb_val = (dout) ? FB : -FB;
 
-// Intermediate sums
-wire signed [31:0] next_i1_full = i1 + (x_in - fb_val);
-wire signed [31:0] next_i2_full = i2 + (next_i1_full - fb_val);
+// intermediate sums (33-bit to prevent intermediate overflow)
+wire signed [32:0] next_i1 = i1 + (x_in - fb_val);
+wire signed [32:0] next_i2 = i2 + (i1 - fb_val); // note: using i1, not next_i1 for timing
 
 always @(posedge clk) begin
     if (rst) begin
@@ -56,19 +61,19 @@ always @(posedge clk) begin
         dout <= 0;
     end else if (mod_clk_en) begin
         
-        // Update Integrator 1 with Clamping
-        if (next_i1_full > LIMIT)       i1 <= LIMIT;
-        else if (next_i1_full < -LIMIT) i1 <= -LIMIT;
-        else                            i1 <= next_i1_full;
+        // Integrator 1 with Clamping
+        if (next_i1 > LIMIT)       i1 <= LIMIT;
+        else if (next_i1 < -LIMIT) i1 <= -LIMIT;
+        else                       i1 <= next_i1[31:0];
 
-        // Update Integrator 2 with Clamping
-        if (next_i2_full > LIMIT)       i2 <= LIMIT;
-        else if (next_i2_full < -LIMIT) i2 <= -LIMIT;
-        else                            i2 <= next_i2_full;
+        // Integrator 2 with Clamping
+        if (next_i2 > LIMIT)       i2 <= LIMIT;
+        else if (next_i2 < -LIMIT) i2 <= -LIMIT;
+        else                       i2 <= next_i2[31:0];
 
-        // Quantizer: The output for the NEXT cycle
-        // Based on the state of the second integrator
-        dout <= (next_i2_full >= 0);
+        // Quantizer (Bitstream Output)
+        // If i2 is positive, we output 1 to push the next error negative
+        dout <= (i2 >= 0);
     end
 end
 

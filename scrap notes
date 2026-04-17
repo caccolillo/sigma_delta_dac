@@ -1,4 +1,3 @@
-
 module sd_dac_8k (
     input  wire        clk,
     input  wire        rst,
@@ -9,86 +8,67 @@ module sd_dac_8k (
 
 localparam integer MOD_DIV = 49;
 
-// 1. INCREASE FEEDBACK STRENGTH
-// Input is +/- 4096. Feedback at 8192 ensures stability (50% modulation index).
-localparam signed [31:0] FB_VAL   = 32'sd8192; 
+// --- MATH SETUP ---
+// Input din is 0 to 8191. 
+// We center it: -4096 to +4095.
+// We set Feedback (FB) to 8192. This 50% ratio is the "Sweet Spot" 
+// for 2nd order stability.
+localparam signed [31:0] FB    = 32'sd8192; 
+localparam signed [31:0] LIMIT = 32'sd16384; // Very tight limit = instant recovery
 
-// 2. TIGHTEN SATURATION (Anti-Windup)
-// This prevents the "stuck at 1" behavior by allowing instant recovery.
-localparam signed [31:0] SAT_LIM  = 32'sd32768;
+reg [5:0]  mod_cnt;
+reg        mod_clk_en;
+reg signed [31:0] x_in;
+reg signed [31:0] i1, i2;
 
-// -----------------------------------------------------------------------
-// Modulator clock enable
-// -----------------------------------------------------------------------
-reg [5:0] mod_cnt;
-reg       mod_clk_en;
-
+// 1. Clock Divider
 always @(posedge clk) begin
     if (rst) begin
-        mod_cnt <= 6'd0;
-        mod_clk_en <= 1'b0;
+        mod_cnt <= 0;
+        mod_clk_en <= 0;
     end else if (mod_cnt == MOD_DIV - 1) begin
-        mod_cnt <= 6'd0;
-        mod_clk_en <= 1'b1;
+        mod_cnt <= 0;
+        mod_clk_en <= 1;
     end else begin
-        mod_clk_en <= 1'b0;
-        mod_cnt <= mod_cnt + 1'b1;
+        mod_cnt <= mod_cnt + 1;
+        mod_clk_en <= 0;
     end
 end
 
-// -----------------------------------------------------------------------
-// Input hold register
-// -----------------------------------------------------------------------
-reg signed [31:0] x_hold;
-
+// 2. Input Latch
 always @(posedge clk) begin
-    if (rst)
-        x_hold <= 32'sd0;
-    else if (samp_valid)
-        // din [0..8191] -> x_hold [-4096..4095]
-        x_hold <= $signed({1'b0, din}) - 32'sd4096;
+    if (rst) x_in <= 0;
+    else if (samp_valid) x_in <= $signed({1'b0, din}) - 32'sd4096;
 end
 
-// -----------------------------------------------------------------------
-// 2nd-order sigma-delta modulator
-// -----------------------------------------------------------------------
-reg signed [31:0] integ1;
-reg signed [31:0] integ2;
+// 3. The Modulator (The "Magic" Logic)
+// Standard 2nd order requires feedback to be subtracted from BOTH stages.
+wire signed [31:0] fb_val = (dout) ? FB : -FB;
 
-// Combinational feedback path (Removes the 1-cycle lag)
-wire signed [31:0] feedback = (dout) ? FB_VAL : -FB_VAL;
-
-// Use temporary variables for the math
-reg signed [31:0] i1_next;
-reg signed [31:0] i2_next;
+// Intermediate sums
+wire signed [31:0] next_i1_full = i1 + (x_in - fb_val);
+wire signed [31:0] next_i2_full = i2 + (next_i1_full - fb_val);
 
 always @(posedge clk) begin
     if (rst) begin
-        integ1   <= 32'sd0;
-        integ2   <= 32'sd0;
-        dout     <= 1'b0;
+        i1   <= 0;
+        i2   <= 0;
+        dout <= 0;
     end else if (mod_clk_en) begin
-
-        // --- Integrator 1 ---
-        i1_next = integ1 + (x_hold - feedback);
         
-        // Saturation 1
-        if      (i1_next >  SAT_LIM) integ1 <=  SAT_LIM;
-        else if (i1_next < -SAT_LIM) integ1 <= -SAT_LIM;
-        else                         integ1 <=  i1_next;
+        // Update Integrator 1 with Clamping
+        if (next_i1_full > LIMIT)       i1 <= LIMIT;
+        else if (next_i1_full < -LIMIT) i1 <= -LIMIT;
+        else                            i1 <= next_i1_full;
 
-        // --- Integrator 2 ---
-        // We integrate the output of the first stage
-        i2_next = integ2 + i1_next;
-        
-        // Saturation 2
-        if      (i2_next >  SAT_LIM) integ2 <=  SAT_LIM;
-        else if (i2_next < -SAT_LIM) integ2 <= -SAT_LIM;
-        else                         integ2 <=  i2_next;
+        // Update Integrator 2 with Clamping
+        if (next_i2_full > LIMIT)       i2 <= LIMIT;
+        else if (next_i2_full < -LIMIT) i2 <= -LIMIT;
+        else                            i2 <= next_i2_full;
 
-        // --- 1-bit Quantizer ---
-        // Decision is made on the state of the second integrator
-        dout <= (i2_next >= 0);
+        // Quantizer: The output for the NEXT cycle
+        // Based on the state of the second integrator
+        dout <= (next_i2_full >= 0);
     end
 end
 

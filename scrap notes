@@ -7,12 +7,15 @@ module sd_dac_8k (
     output reg         dout
 );
 
-// Modulator clock: 100 MHz / 49 = 2.0408 MHz  (OSR ~= 255)
 localparam integer MOD_DIV = 49;
 
-localparam signed [31:0] QUANT_STEP = 32'sh0000_1000; // 4096, matches input FS
-localparam signed [31:0] SAT_POS    =  32'sh03FF_FFFF;
-localparam signed [31:0] SAT_NEG    = -32'sh03FF_FFFF;
+// 1. INCREASE FEEDBACK STRENGTH
+// Input is +/- 4096. Feedback at 8192 ensures stability (50% modulation index).
+localparam signed [31:0] FB_VAL   = 32'sd8192; 
+
+// 2. TIGHTEN SATURATION (Anti-Windup)
+// This prevents the "stuck at 1" behavior by allowing instant recovery.
+localparam signed [31:0] SAT_LIM  = 32'sd32768;
 
 // -----------------------------------------------------------------------
 // Modulator clock enable
@@ -22,22 +25,19 @@ reg       mod_clk_en;
 
 always @(posedge clk) begin
     if (rst) begin
-        mod_cnt    <= 6'd0;
+        mod_cnt <= 6'd0;
         mod_clk_en <= 1'b0;
+    end else if (mod_cnt == MOD_DIV - 1) begin
+        mod_cnt <= 6'd0;
+        mod_clk_en <= 1'b1;
     end else begin
         mod_clk_en <= 1'b0;
-        if (mod_cnt == MOD_DIV - 1) begin
-            mod_cnt    <= 6'd0;
-            mod_clk_en <= 1'b1;
-        end else
-            mod_cnt <= mod_cnt + 1'b1;
+        mod_cnt <= mod_cnt + 1'b1;
     end
 end
 
 // -----------------------------------------------------------------------
 // Input hold register
-// 13-bit unsigned offset-binary -> 32-bit signed, centred at 0
-// din=0    -> -4096,  din=4096 -> 0,  din=8191 -> +4095
 // -----------------------------------------------------------------------
 reg signed [31:0] x_hold;
 
@@ -45,21 +45,20 @@ always @(posedge clk) begin
     if (rst)
         x_hold <= 32'sd0;
     else if (samp_valid)
+        // din [0..8191] -> x_hold [-4096..4095]
         x_hold <= $signed({1'b0, din}) - 32'sd4096;
 end
 
 // -----------------------------------------------------------------------
 // 2nd-order sigma-delta modulator
-// Intermediate regs declared at module scope -- no 'automatic' keyword
 // -----------------------------------------------------------------------
 reg signed [31:0] integ1;
 reg signed [31:0] integ2;
-reg signed [31:0] quant_fb;
 
-// These are combinational intermediates written and read in the same
-// always block tick.  Declare as reg at module level -- synthesis
-// correctly infers them as wires when used this way.
-reg signed [31:0] err;
+// Combinational feedback path (Removes the 1-cycle lag)
+wire signed [31:0] feedback = (dout) ? FB_VAL : -FB_VAL;
+
+// Use temporary variables for the math
 reg signed [31:0] i1_next;
 reg signed [31:0] i2_next;
 
@@ -67,31 +66,29 @@ always @(posedge clk) begin
     if (rst) begin
         integ1   <= 32'sd0;
         integ2   <= 32'sd0;
-        quant_fb <= 32'sd0;
         dout     <= 1'b0;
     end else if (mod_clk_en) begin
 
-        err    = x_hold - quant_fb;       // blocking: computed immediately
+        // --- Integrator 1 ---
+        i1_next = integ1 + (x_hold - feedback);
+        
+        // Saturation 1
+        if      (i1_next >  SAT_LIM) integ1 <=  SAT_LIM;
+        else if (i1_next < -SAT_LIM) integ1 <= -SAT_LIM;
+        else                         integ1 <=  i1_next;
 
-        i1_next = integ1 + err;
-        if      (i1_next > SAT_POS) i1_next = SAT_POS;
-        else if (i1_next < SAT_NEG) i1_next = SAT_NEG;
-
+        // --- Integrator 2 ---
+        // We integrate the output of the first stage
         i2_next = integ2 + i1_next;
-        if      (i2_next > SAT_POS) i2_next = SAT_POS;
-        else if (i2_next < SAT_NEG) i2_next = SAT_NEG;
+        
+        // Saturation 2
+        if      (i2_next >  SAT_LIM) integ2 <=  SAT_LIM;
+        else if (i2_next < -SAT_LIM) integ2 <= -SAT_LIM;
+        else                         integ2 <=  i2_next;
 
-        // 1-bit quantiser
-        if (i2_next >= 32'sd0) begin
-            dout     <= 1'b1;
-            quant_fb <= QUANT_STEP;
-        end else begin
-            dout     <= 1'b0;
-            quant_fb <= -QUANT_STEP;
-        end
-
-        integ1 <= i1_next;   // non-blocking: registers update at end of tick
-        integ2 <= i2_next;
+        // --- 1-bit Quantizer ---
+        // Decision is made on the state of the second integrator
+        dout <= (i2_next >= 0);
     end
 end
 

@@ -1,243 +1,89 @@
-// =============================================================================
-// sd_dac_8k.v  —  Updated 2nd-order Sigma-Delta DAC
-// =============================================================================
- 
 module sd_dac_8k (
-    input  wire        clk,        // 100 MHz system clock
-    input  wire        rst,        // synchronous active-high reset
-    input  wire        samp_valid, // pulses at 8 kHz
-    input  wire [12:0] din,        // unsigned 13-bit PCM [0 to 8191]
-    output reg         dout        // 1-bit bitstream
+    input  wire        clk,
+    input  wire        rst,
+    input  wire        samp_valid,
+    input  wire [12:0] din,
+    output reg         dout
 );
- 
-// ---------------------------------------------------------------------------
-// Parameters & Constants
-// ---------------------------------------------------------------------------
-localparam MOD_DIV = 49; // ~2.041 MHz
 
-// We scale the internal math to 32-bit signed.
-// Max input magnitude is 4096. 
-// We set QUANT_STEP (Feedback) to be larger than the max input to ensure stability.
-localparam signed [31:0] FEEDBACK = 32'sd8192; 
+localparam integer MOD_DIV  = 49;
 
-// Tighten saturation to prevent "latch-up" (wind-up). 
-// If it hits the rail, it can now recover in ~10-20 cycles instead of millions.
-localparam signed [31:0] SAT_LIMIT = 32'sd65536; 
- 
+// Saturation limits — 32-bit signed, leave top 4 bits as headroom
+localparam signed [31:0] SAT_POS =  32'sh03FF_FFFF;
+localparam signed [31:0] SAT_NEG = -32'sh03FF_FFFF;
+
+// Quantiser step: match the input full-scale exactly.
+// din is 13-bit → max unsigned value 8191.
+// We map to signed range [-8192, +8191] by subtracting 4096,
+// then scale up by 4 (shift left 2) to give [-32768, +32764]
+// in a 32-bit signed context. QUANT_STEP must match this FS.
+localparam signed [31:0] QUANT_STEP = 32'sh0000_8000; // 32768
+
 // ---------------------------------------------------------------------------
-// Clock Divider
+// Modulator clock enable
 // ---------------------------------------------------------------------------
 reg [5:0] mod_cnt;
 reg       mod_clk_en;
- 
-always @(posedge clk) begin
-    if (rst) begin
-        mod_cnt    <= 6'd0;
-        mod_clk_en <= 1'b0;
-    end else if (mod_cnt == MOD_DIV - 1) begin
-        mod_cnt    <= 6'd0;
-        mod_clk_en <= 1'b1;
-    end else begin
-        mod_cnt    <= mod_cnt + 1'b1;
-        mod_clk_en <= 1'b0;
-    end
-end
- 
-// ---------------------------------------------------------------------------
-// Input Conditioning
-// ---------------------------------------------------------------------------
-reg signed [31:0] x_in; 
- 
-always @(posedge clk) begin
-    if (rst) begin
-        x_in <= 32'sd0;
-    end else if (samp_valid) begin
-        // Convert 13-bit unsigned [0..8191] to signed [-4096..4095]
-        // 4096 is the perfect midpoint for 13-bit offset binary.
-        x_in <= $signed({1'b0, din}) - 32'sd4096;
-    end
-end
- 
-// ---------------------------------------------------------------------------
-// 2nd-Order Modulator Logic
-// ---------------------------------------------------------------------------
-reg signed [31:0] integ1;
-reg signed [31:0] integ2;
-wire signed [31:0] fb_val;
-
-// Feedback value based on previous output bit
-assign fb_val = (dout) ? FEEDBACK : -FEEDBACK;
-
-// Temporary variables for addition and clamping
-reg signed [31:0] next_i1;
-reg signed [31:0] next_i2;
-
-always @(posedge clk) begin
-    if (rst) begin
-        integ1 <= 32'sd0;
-        integ2 <= 32'sd0;
-        dout   <= 1'b0;
-    end else if (mod_clk_en) begin
-        
-        // --- Integrator 1: i1 = i1 + (input - feedback) ---
-        next_i1 = integ1 + (x_in - fb_val);
-        
-        // Clamping Integ 1
-        if (next_i1 > SAT_LIMIT)       integ1 <= SAT_LIMIT;
-        else if (next_i1 < -SAT_LIMIT) integ1 <= -SAT_LIMIT;
-        else                           integ1 <= next_i1;
-
-        // --- Integrator 2: i2 = i2 + (i1 - feedback) ---
-        // Using standard Error Feedback topology for 2nd order stability
-        next_i2 = integ2 + (next_i1 - fb_val);
-        
-        // Clamping Integ 2
-        if (next_i2 > SAT_LIMIT)       integ2 <= SAT_LIMIT;
-        else if (next_i2 < -SAT_LIMIT) integ2 <= -SAT_LIMIT;
-        else                           integ2 <= next_i2;
-
-        // --- Quantizer (Decision) ---
-        // MSB of second integrator determines the bitstream
-        dout <= (next_i2 >= 0);
-    end
-end
- 
-endmodule
-
-
-// =============================================================================
-// sd_dac_8k.v  —  13-bit ENOB 2nd-order sigma-delta DAC
-//
-// System clock : 100 MHz
-// Sample rate  : 8 kHz  (clk / 12500)
-// Mod clock    : ~2.041 MHz  (clk / 49)  → OSR ≈ 255
-// Passband     : 300 Hz – 3.4 kHz
-// Analog stage : 2× Sallen-Key LPF (OPA1678), Fc = 3.8 kHz, Q = 0.707
-//
-// Signal path
-//   din[12:0] (unsigned, offset-binary)
-//     → sign-extend + DC-offset to signed 16-bit
-//     → zero-order hold at mod-clock rate
-//     → 2nd-order sigma-delta modulator
-//     → dout (1-bit PWM bitstream @ ~2.041 MHz)
-//
-// 2nd-order modulator topology (Mason / Candy):
-//   e[n]  = x[n] - q[n-1]           (error)
-//   i1[n] = i1[n-1] + e[n]          (integrator 1)
-//   i2[n] = i2[n-1] + i1[n]         (integrator 2)
-//   q[n]  = (i2[n] >= 0) ? +Δ : -Δ  (1-bit quantiser)
-//   dout  = (q[n] >= 0)  ? 1 : 0
-//
-// Internal word widths
-//   16-bit input (signed), 32-bit integrators (signed)
-//   Integrators include saturation clamps to prevent overflow wind-up.
-// =============================================================================
-
-module sd_dac_8k (
-    input  wire        clk,        // 100 MHz system clock
-    input  wire        rst,        // synchronous active-high reset
-    input  wire        samp_valid, // pulses one clk cycle at 8 kHz
-    input  wire [12:0] din,        // unsigned offset-binary PCM sample
-    output reg         dout        // 1-bit sigma-delta bitstream
-);
-
-// ---------------------------------------------------------------------------
-// Parameters
-// ---------------------------------------------------------------------------
-localparam CLK_FREQ   = 100_000_000;
-localparam SAMP_RATE  =       8_000;
-localparam MOD_DIV    =          49; // 100 MHz / 49 ≈ 2.0408 MHz mod clock
-
-// Integrator saturation limits (prevent catastrophic overflow)
-// 32-bit signed range; we clamp well within to keep stable headroom
-localparam signed [31:0] SAT_POS =  32'sh07FF_FFFF;  // +134 217 727
-localparam signed [31:0] SAT_NEG = -32'sh07FF_FFFF;  // -134 217 727
-
-// Input full-scale: 13-bit unsigned → 16-bit signed centred at 0
-// 0x0000 maps to -4096, 0x1FFF maps to +4095
-// Achieved by sign-extending to 16 bits and subtracting 4096
-
-// ---------------------------------------------------------------------------
-// Clock divider for modulator clock (~2.041 MHz)
-// ---------------------------------------------------------------------------
-reg [5:0]  mod_cnt;
-reg        mod_clk_en;   // single-cycle pulse at mod rate
 
 always @(posedge clk) begin
     if (rst) begin
         mod_cnt    <= 6'd0;
         mod_clk_en <= 1'b0;
     end else begin
+        mod_clk_en <= 1'b0;
         if (mod_cnt == MOD_DIV - 1) begin
             mod_cnt    <= 6'd0;
             mod_clk_en <= 1'b1;
         end else begin
-            mod_cnt    <= mod_cnt + 1'b1;
-            mod_clk_en <= 1'b0;
+            mod_cnt <= mod_cnt + 1'b1;
         end
     end
 end
 
 // ---------------------------------------------------------------------------
-// Input register — latch new sample on samp_valid, hold until next
+// Input register: 13-bit unsigned → 32-bit signed, scaled
 // ---------------------------------------------------------------------------
-reg signed [15:0] x_hold;   // signed 16-bit held sample
+reg signed [31:0] x_hold;
 
 always @(posedge clk) begin
     if (rst) begin
-        x_hold <= 16'sd0;
+        x_hold <= 32'sd0;
     end else if (samp_valid) begin
-        // Convert offset-binary 13-bit → signed 16-bit:
-        //   unsigned din  range [0, 8191]
-        //   shift left 3 bits to gain dynamic range → [0, 65528]
-        //   interpret as 16-bit then subtract 32768 to centre → [-32768, 32760]
-        x_hold <= {3'b000, din} - 16'sd4096;
+        // 1. Subtract mid-code (4096) to centre around zero  → range [-4096, +4095]
+        // 2. Shift left 3 to scale up to ±32768 range        → range [-32768, +32760]
+        x_hold <= ($signed({1'b0, din}) - 32'sd4096) <<< 3;
     end
 end
 
 // ---------------------------------------------------------------------------
-// 2nd-order sigma-delta modulator (clocked at mod_clk_en)
+// 2nd-order sigma-delta modulator
 // ---------------------------------------------------------------------------
-reg signed [31:0] integ1;    // integrator 1 state
-reg signed [31:0] integ2;    // integrator 2 state
-reg signed [31:0] quant_fb;  // feedback value  (+Q or -Q)
-
-// Quantiser step mapped to integrator scale.
-// Input is 16-bit, integrators are 32-bit.
-// Feed-forward gain = 1 (shift left 0), feedback = full-scale.
-localparam signed [31:0] QUANT_STEP = 32'sh0000_1000; // 4096 — tuned for loop gain
-
-wire signed [31:0] x_ext = {{16{x_hold[15]}}, x_hold}; // sign-extend to 32 bits
-
-// Saturation helper function (implemented inline below)
-// sat32(v) = clamp(v, SAT_NEG, SAT_POS)
-
-reg signed [31:0] err;
-reg signed [31:0] i1_next;
-reg signed [31:0] i2_next;
+reg signed [31:0] integ1;
+reg signed [31:0] integ2;
+reg signed [31:0] quant_fb;
 
 always @(posedge clk) begin
     if (rst) begin
         integ1   <= 32'sd0;
         integ2   <= 32'sd0;
-        quant_fb <= QUANT_STEP;
+        quant_fb <= 32'sd0;   // <-- zero, not +QUANT_STEP, prevents latch-high on reset
         dout     <= 1'b0;
     end else if (mod_clk_en) begin
+        automatic signed [31:0] err;
+        automatic signed [31:0] i1_next;
+        automatic signed [31:0] i2_next;
 
-        // Error signal: input minus quantiser feedback
-        err = x_ext - quant_fb;
+        err    = x_hold - quant_fb;
 
-        // Integrator 1 with saturation
         i1_next = integ1 + err;
         if      (i1_next > SAT_POS) i1_next = SAT_POS;
         else if (i1_next < SAT_NEG) i1_next = SAT_NEG;
 
-        // Integrator 2 with saturation
         i2_next = integ2 + i1_next;
         if      (i2_next > SAT_POS) i2_next = SAT_POS;
         else if (i2_next < SAT_NEG) i2_next = SAT_NEG;
 
-        // 1-bit quantiser: MSB (sign bit) decides output
+        // 1-bit quantiser
         if (i2_next >= 32'sd0) begin
             dout     <= 1'b1;
             quant_fb <= QUANT_STEP;
@@ -246,7 +92,6 @@ always @(posedge clk) begin
             quant_fb <= -QUANT_STEP;
         end
 
-        // Update integrator states
         integ1 <= i1_next;
         integ2 <= i2_next;
     end

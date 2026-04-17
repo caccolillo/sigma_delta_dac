@@ -1,4 +1,111 @@
 // =============================================================================
+// sd_dac_8k.v  —  Updated 2nd-order Sigma-Delta DAC
+// =============================================================================
+ 
+module sd_dac_8k (
+    input  wire        clk,        // 100 MHz system clock
+    input  wire        rst,        // synchronous active-high reset
+    input  wire        samp_valid, // pulses at 8 kHz
+    input  wire [12:0] din,        // unsigned 13-bit PCM [0 to 8191]
+    output reg         dout        // 1-bit bitstream
+);
+ 
+// ---------------------------------------------------------------------------
+// Parameters & Constants
+// ---------------------------------------------------------------------------
+localparam MOD_DIV = 49; // ~2.041 MHz
+
+// We scale the internal math to 32-bit signed.
+// Max input magnitude is 4096. 
+// We set QUANT_STEP (Feedback) to be larger than the max input to ensure stability.
+localparam signed [31:0] FEEDBACK = 32'sd8192; 
+
+// Tighten saturation to prevent "latch-up" (wind-up). 
+// If it hits the rail, it can now recover in ~10-20 cycles instead of millions.
+localparam signed [31:0] SAT_LIMIT = 32'sd65536; 
+ 
+// ---------------------------------------------------------------------------
+// Clock Divider
+// ---------------------------------------------------------------------------
+reg [5:0] mod_cnt;
+reg       mod_clk_en;
+ 
+always @(posedge clk) begin
+    if (rst) begin
+        mod_cnt    <= 6'd0;
+        mod_clk_en <= 1'b0;
+    end else if (mod_cnt == MOD_DIV - 1) begin
+        mod_cnt    <= 6'd0;
+        mod_clk_en <= 1'b1;
+    end else begin
+        mod_cnt    <= mod_cnt + 1'b1;
+        mod_clk_en <= 1'b0;
+    end
+end
+ 
+// ---------------------------------------------------------------------------
+// Input Conditioning
+// ---------------------------------------------------------------------------
+reg signed [31:0] x_in; 
+ 
+always @(posedge clk) begin
+    if (rst) begin
+        x_in <= 32'sd0;
+    end else if (samp_valid) begin
+        // Convert 13-bit unsigned [0..8191] to signed [-4096..4095]
+        // 4096 is the perfect midpoint for 13-bit offset binary.
+        x_in <= $signed({1'b0, din}) - 32'sd4096;
+    end
+end
+ 
+// ---------------------------------------------------------------------------
+// 2nd-Order Modulator Logic
+// ---------------------------------------------------------------------------
+reg signed [31:0] integ1;
+reg signed [31:0] integ2;
+wire signed [31:0] fb_val;
+
+// Feedback value based on previous output bit
+assign fb_val = (dout) ? FEEDBACK : -FEEDBACK;
+
+// Temporary variables for addition and clamping
+reg signed [31:0] next_i1;
+reg signed [31:0] next_i2;
+
+always @(posedge clk) begin
+    if (rst) begin
+        integ1 <= 32'sd0;
+        integ2 <= 32'sd0;
+        dout   <= 1'b0;
+    end else if (mod_clk_en) begin
+        
+        // --- Integrator 1: i1 = i1 + (input - feedback) ---
+        next_i1 = integ1 + (x_in - fb_val);
+        
+        // Clamping Integ 1
+        if (next_i1 > SAT_LIMIT)       integ1 <= SAT_LIMIT;
+        else if (next_i1 < -SAT_LIMIT) integ1 <= -SAT_LIMIT;
+        else                           integ1 <= next_i1;
+
+        // --- Integrator 2: i2 = i2 + (i1 - feedback) ---
+        // Using standard Error Feedback topology for 2nd order stability
+        next_i2 = integ2 + (next_i1 - fb_val);
+        
+        // Clamping Integ 2
+        if (next_i2 > SAT_LIMIT)       integ2 <= SAT_LIMIT;
+        else if (next_i2 < -SAT_LIMIT) integ2 <= -SAT_LIMIT;
+        else                           integ2 <= next_i2;
+
+        // --- Quantizer (Decision) ---
+        // MSB of second integrator determines the bitstream
+        dout <= (next_i2 >= 0);
+    end
+end
+ 
+endmodule
+
+
+// =============================================================================
 // sd_dac_8k.v  —  13-bit ENOB 2nd-order sigma-delta DAC
 //
 // System clock : 100 MHz

@@ -1,63 +1,91 @@
+// ==========================================================
+// 2nd-Order Sigma-Delta Modulator
+// Optimized for QSPICE / Verilog-2001
+// ==========================================================
 module sd_dac_8k (
-    input  wire        clk,        // 100 MHz
-    input  wire        rst,        // active-high
-    input  wire        samp_valid, // 8 kHz pulse
-    input  wire [12:0] din,        // 0 to 8191
-    output reg         dout        // PDM out
+    input clk,            // 100MHz System Clock
+    input rst,            // Active High Reset
+    input samp_valid,     // 8kHz Pulse
+    input [12:0] din,     // 13-bit Unsigned Input (0 to 8191)
+    output reg dout       // 1-bit PDM Output
 );
 
-// --- Clock Enable (2.04 MHz) ---
-reg [5:0] cnt;
-reg       ce;
-always @(posedge clk) begin
-    if (rst) begin cnt <= 0; ce <= 0; end
-    else if (cnt == 48) begin cnt <= 0; ce <= 1; end
-    else begin cnt <= cnt + 1; ce <= 0; end
-end
+    // --- Internal Constants ---
+    // Using 32-bit signed math for stability
+    parameter signed [31:0] FB    = 8192;   // Feedback strength
+    parameter signed [31:0] LIMIT = 16384;  // Anti-windup saturation limit
 
-// --- Signed Input Logic ---
-// We convert 13-bit unsigned to 16-bit signed.
-// Range: -4096 to +4095
-reg signed [15:0] x;
-always @(posedge clk) begin
-    if (rst) x <= 0;
-    else if (samp_valid) x <= $signed({1'b0, din}) - 16'sd4096;
-end
-
-// --- Modulator ---
-// Using 32-bit integrators for high precision.
-// FB is 8192, which is 2x the max input (Safe stability index).
-reg signed [31:0] i1, i2;
-localparam signed [31:0] FB = 32'sd8192; 
-localparam signed [31:0] LIM = 32'sd16384; // Clamp
-
-always @(posedge clk) begin
-    if (rst) begin
-        i1   <= 0;
-        i2   <= 0;
-        dout <= 0;
-    end else if (ce) begin
-        // Use the current dout to decide the feedback for this cycle
-        // If we just output a 1, we subtract FB. If 0, we add FB.
-        automatic signed [31:0] fb_val = dout ? FB : -FB;
-        
-        // --- Integrator 1 ---
-        // New i1 = i1 + error
-        // Clamping to LIM prevents wind-up
-        if      (i1 + (x - fb_val) >  LIM) i1 <=  LIM;
-        else if (i1 + (x - fb_val) < -LIM) i1 <= -LIM;
-        else                               i1 <= i1 + (x - fb_val);
-
-        // --- Integrator 2 ---
-        // New i2 = i2 + (i1_delayed - fb_val)
-        if      (i2 + (i1 - fb_val) >  LIM) i2 <=  LIM;
-        else if (i2 + (i1 - fb_val) < -LIM) i2 <= -LIM;
-        else                                i2 <= i2 + (i1 - fb_val);
-
-        // --- Decision (Quantizer) ---
-        // If the accumulated error in i2 is positive, output a 1
-        dout <= (i2 >= 0);
+    // --- Clock Divider (100MHz -> 2.04MHz) ---
+    reg [5:0] count;
+    reg mod_clk_en;
+    
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            count <= 6'd0;
+            mod_clk_en <= 1'b0;
+        end else begin
+            if (count == 48) begin
+                count <= 6'd0;
+                mod_clk_en <= 1'b1;
+            end else begin
+                count <= count + 1'b1;
+                mod_clk_en <= 1'b0;
+            end
+        end
     end
-end
+
+    // --- Input Sample and Hold ---
+    // Convert 13-bit unsigned [0..8191] to signed [-4096..4095]
+    reg signed [31:0] x_in;
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            x_in <= 32'sd0;
+        end else if (samp_valid) begin
+            x_in <= $signed({1'b0, din}) - 32'sd4096;
+        end
+    end
+
+    // --- 2nd Order Modulator (Boser-Wooley) ---
+    reg signed [31:0] i1;
+    reg signed [31:0] i2;
+    wire signed [31:0] feedback;
+    
+    assign feedback = (dout) ? FB : -FB;
+
+    // Use combinational wires for the sum to allow clamping logic
+    wire signed [31:0] next_i1;
+    wire signed [31:0] next_i2;
+    
+    assign next_i1 = i1 + (x_in - feedback);
+    assign next_i2 = i2 + (i1 - feedback);
+
+    always @(posedge clk or posedge rst) begin
+        if (rst) begin
+            i1   <= 32'sd0;
+            i2   <= 32'sd0;
+            dout <= 1'b0;
+        end else if (mod_clk_en) begin
+            
+            // Update Integrator 1 with Saturation
+            if (next_i1 > LIMIT)
+                i1 <= LIMIT;
+            else if (next_i1 < -LIMIT)
+                i1 <= -LIMIT;
+            else
+                i1 <= next_i1;
+
+            // Update Integrator 2 with Saturation
+            if (next_i2 > LIMIT)
+                i2 <= LIMIT;
+            else if (next_i2 < -LIMIT)
+                i2 <= -LIMIT;
+            else
+                i2 <= next_i2;
+
+            // Quantizer Decision (Output bit)
+            // If accumulated error is positive, output 1
+            dout <= (next_i2 >= 0);
+        end
+    end
 
 endmodule

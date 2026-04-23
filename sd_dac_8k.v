@@ -1,59 +1,53 @@
 module sd_dac (
     input  wire        clk,        // 100 MHz
-    input  wire        rst,        // active high
-    input  wire        samp_valid, // 8 kHz
-    input  wire [12:0] din,        // 13-bit input
+    input  wire        rst,        // active high reset
+    input  wire        samp_valid, // 8 kHz sample valid
+    input  wire [12:0] din,           // 13-bit input sample
     output reg         dout        // 5 MHz PDM output
 );
 
-    // --- Clock Divider (5 MHz) ---
+    // --- 1. Clock Divider (100MHz -> 5MHz) ---
     reg [4:0] clk_div_cnt;
     wire      tick_5mhz = (clk_div_cnt == 5'd19);
+
     always @(posedge clk or posedge rst) begin
-        if (rst) clk_div_cnt <= 0;
-        else clk_div_cnt <= tick_5mhz ? 0 : clk_div_cnt + 1;
+        if (rst) clk_div_cnt <= 5'd0;
+        else clk_div_cnt <= tick_5mhz ? 5'd0 : clk_div_cnt + 1'b1;
     end
 
-    // --- Sample Hold ---
+    // --- 2. Input Sample Hold ---
     reg [12:0] x_in;
     always @(posedge clk or posedge rst) begin
-        if (rst) x_in <= 13'h1000;
+        if (rst) x_in <= 13'd0; // Bug 3 Fix: Reset to 0
         else if (samp_valid) x_in <= din;
     end
 
-    // --- MASH 1-1 Logic ---
-    // Each accumulator is 14 bits (13 bits + 1 bit carry)
-    reg [13:0] acc1; 
-    reg [13:0] acc2;
-    reg        c1, c2, c2_delayed;
+    // --- 3. Combinational 2nd-Order Logic (Bug 1 & 2 Fix) ---
+    // Use 20 bits to prevent overflow during intermediate sums
+    reg signed [19:0] acc1, acc2;
+    wire signed [19:0] x_signed = $signed({1'b0, x_in});
+    
+    // Feedback: If the PREVIOUS dout was 1, we subtract 8191. If 0, we subtract 0.
+    // This is the standard 1-bit DAC feedback loop.
+    wire signed [19:0] fb = dout ? 20'sd8191 : 20'sd0;
+
+    // FRESH VALUES: We calculate the sums combinatorially before registering them
+    wire signed [19:0] next_acc1 = acc1 + (x_signed - fb);
+    wire signed [19:0] next_acc2 = acc2 + (next_acc1 - fb);
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            acc1 <= 0;
-            acc2 <= 0;
-            c1   <= 0;
-            c2   <= 0;
-            c2_delayed <= 0;
-            dout <= 0;
+            acc1 <= 20'sd0;
+            acc2 <= 20'sd0;
+            dout <= 1'b0;
         end else if (tick_5mhz) begin
-            // STAGE 1: Standard 1st order SDM
-            // The carry out (acc1[13]) is the 1st order bitstream
-            acc1 <= acc1[12:0] + x_in;
-            c1   <= acc1[13];
-
-            // STAGE 2: Processes the "error" (remainder) of Stage 1
-            // The input to Stage 2 is the remainder of the first accumulator
-            acc2 <= acc2[12:0] + acc1[12:0];
-            c2   <= acc2[13];
+            // Update the state with the freshly calculated sums
+            acc1 <= next_acc1;
+            acc2 <= next_acc2;
             
-            // MASH Combination Logic:
-            // In a MASH 1-1, the output is: Carry1 + (Carry2 - Carry2_Delayed)
-            c2_delayed <= c2;
-
-            // To keep 'dout' as a single bit (0 or 1) for your PDM filter:
-            // We use the Carry 1 as the primary driver, and Carry 2
-            // provides the high-frequency "dither" for 2nd order shaping.
-            dout <= c1 | (c2 & !c2_delayed);
+            // Quantizer: Current output is based on the fresh internal state
+            // This closes the loop without the 1-cycle carry lag.
+            dout <= (next_acc2 >= 20'sd0);
         end
     end
 

@@ -1,67 +1,59 @@
 module sd_dac (
     input  wire        clk,        // 100 MHz
-    input  wire        rst,        // active high reset
-    input  wire        samp_valid, // 8 kHz pulse
-    input  wire [12:0] din,        // 13-bit input (0 to 8191)
+    input  wire        rst,        // active high
+    input  wire        samp_valid, // 8 kHz
+    input  wire [12:0] din,        // 13-bit input
     output reg         dout        // 5 MHz PDM output
 );
 
-    // --- Signals ---
-    reg [12:0] sample_hold;
-    reg [4:0]  clk_div_cnt;
-    wire       tick_5mhz;
+    // --- Clock Divider (5 MHz) ---
+    reg [4:0] clk_div_cnt;
+    wire      tick_5mhz = (clk_div_cnt == 5'd19);
+    always @(posedge clk or posedge rst) begin
+        if (rst) clk_div_cnt <= 0;
+        else clk_div_cnt <= tick_5mhz ? 0 : clk_div_cnt + 1;
+    end
 
-    // Accumulators for MASH structure
-    // We use 14 bits to catch the carry out (MSB)
+    // --- Sample Hold ---
+    reg [12:0] x_in;
+    always @(posedge clk or posedge rst) begin
+        if (rst) x_in <= 13'h1000;
+        else if (samp_valid) x_in <= din;
+    end
+
+    // --- MASH 1-1 Logic ---
+    // Each accumulator is 14 bits (13 bits + 1 bit carry)
     reg [13:0] acc1; 
     reg [13:0] acc2;
-    
-    // --- 1. Clock Divider (100MHz to 5MHz) ---
-    assign tick_5mhz = (clk_div_cnt == 5'd19);
-    always @(posedge clk or posedge rst) begin
-        if (rst) 
-            clk_div_cnt <= 5'd0;
-        else 
-            clk_div_cnt <= tick_5mhz ? 5'd0 : clk_div_cnt + 1'b1;
-    end
-
-    // --- 2. Input Sample Hold ---
-    always @(posedge clk or posedge rst) begin
-        if (rst) 
-            sample_hold <= 13'h1000; // Mid-scale
-        else if (samp_valid) 
-            sample_hold <= din;
-    end
-
-    // --- 3. MASH 1-1 Second Order Modulator ---
-    // This structure is mathematically stable and won't "explode"
-    reg carry1_d1, carry2, carry2_d1;
+    reg        c1, c2, c2_delayed;
 
     always @(posedge clk or posedge rst) begin
         if (rst) begin
-            acc1      <= 0;
-            acc2      <= 0;
-            carry1_d1 <= 0;
-            carry2_d1 <= 0;
-            dout      <= 0;
+            acc1 <= 0;
+            acc2 <= 0;
+            c1   <= 0;
+            c2   <= 0;
+            c2_delayed <= 0;
+            dout <= 0;
         end else if (tick_5mhz) begin
-            // First Stage (1st order)
-            acc1 <= acc1[12:0] + sample_hold;
-            
-            // Second Stage (Integrates the error of the first stage)
+            // STAGE 1: Standard 1st order SDM
+            // The carry out (acc1[13]) is the 1st order bitstream
+            acc1 <= acc1[12:0] + x_in;
+            c1   <= acc1[13];
+
+            // STAGE 2: Processes the "error" (remainder) of Stage 1
+            // The input to Stage 2 is the remainder of the first accumulator
             acc2 <= acc2[12:0] + acc1[12:0];
+            c2   <= acc2[13];
             
-            // Delay the carries to perform the digital differentiation
-            carry1_d1 <= acc1[13];
-            carry2_d1 <= acc2[13];
-            
-            // The 2nd Order Result is: Carry1 + (Carry2 - Carry2_delayed)
-            // Since we need a 1-bit output (0 or 1), we quantize the result:
-            // If the sum > 0, output 1.
-            if (acc1[13] || acc2[13]) 
-                dout <= 1'b1;
-            else 
-                dout <= 1'b0;
+            // MASH Combination Logic:
+            // In a MASH 1-1, the output is: Carry1 + (Carry2 - Carry2_Delayed)
+            c2_delayed <= c2;
+
+            // To keep 'dout' as a single bit (0 or 1) for your PDM filter:
+            // We use the Carry 1 as the primary driver, and Carry 2
+            // provides the high-frequency "dither" for 2nd order shaping.
+            dout <= c1 | (c2 & !c2_delayed);
         end
     end
 

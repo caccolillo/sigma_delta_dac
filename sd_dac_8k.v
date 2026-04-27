@@ -1,5 +1,5 @@
 // =============================================================================
-// sd_dac.v — fixed timing, OSR counter drives SDM not separate clock divider
+// sd_dac.v — with built-in self-test to diagnose stuck output
 // =============================================================================
 
 module sd_dac (
@@ -10,6 +10,14 @@ module sd_dac (
     output reg         dout
 );
 
+    // ----------------------------------------------------------------
+    //  SELF TEST — comment out after confirming dout toggles
+    //  Forces dout to toggle at 5 MHz regardless of SDM state
+    //  If dout still does not toggle, problem is in QSPICE wiring
+    //  not in the Verilog
+    // ----------------------------------------------------------------
+    localparam SELF_TEST = 0;   // set to 1 to enable, 0 to disable
+
     localparam signed [31:0] B1 =  32'sd25564;
     localparam signed [31:0] A1 =  32'sd25564;
     localparam signed [31:0] C1 =  32'sd437;
@@ -17,28 +25,10 @@ module sd_dac (
 
     localparam signed [31:0] ACC_MAX =  32'sd524287;
     localparam signed [31:0] ACC_MIN = -32'sd524288;
-
-    // OSR = 5MHz / 8kHz = 625
-    // SDM runs 625 times per audio sample
-    // Each SDM tick = 100MHz / 5MHz = 20 clock cycles
-    localparam [31:0] SDM_DIV = 32'd20;    // 100 MHz / 5 MHz
-    localparam [31:0] OSR     = 32'd625;   // SDM cycles per audio sample
+    localparam        [31:0] SDM_DIV = 32'd20;
 
     // ----------------------------------------------------------------
-    //  INPUT LATCH — updated on samp_valid
-    // ----------------------------------------------------------------
-    reg signed [31:0] u_reg;
-
-    always @(posedge clk) begin
-        if (rst)
-            u_reg <= 32'sd0;
-        else if (samp_valid)
-            u_reg <= {{19{din[12]}}, din};
-    end
-
-    // ----------------------------------------------------------------
-    //  SDM CLOCK DIVIDER — 100 MHz → 5 MHz
-    //  Runs freely, independent of samp_valid
+    //  CLOCK DIVIDER — 100 MHz → 5 MHz
     // ----------------------------------------------------------------
     reg [31:0] clk_cnt;
     wire       sdm_en;
@@ -54,14 +44,38 @@ module sd_dac (
     end
 
     // ----------------------------------------------------------------
-    //  INTEGRATOR REGISTERS
+    //  SELF TEST OUTPUT — toggle dout at 5 MHz
+    //  Use this to verify QSPICE wiring before testing SDM
+    // ----------------------------------------------------------------
+    generate
+        if (SELF_TEST == 1) begin
+            always @(posedge clk) begin
+                if (rst)
+                    dout <= 1'b0;
+                else if (sdm_en)
+                    dout <= ~dout;
+            end
+        end
+    endgenerate
+
+    // ----------------------------------------------------------------
+    //  INPUT LATCH
+    // ----------------------------------------------------------------
+    reg signed [31:0] u_reg;
+
+    always @(posedge clk) begin
+        if (rst)
+            u_reg <= 32'sd0;
+        else if (samp_valid)
+            u_reg <= {{19{din[12]}}, din};
+    end
+
+    // ----------------------------------------------------------------
+    //  INTEGRATORS
     // ----------------------------------------------------------------
     reg signed [31:0] int1_reg;
     reg signed [31:0] int2_reg;
 
-    // ----------------------------------------------------------------
-    //  COMBINATORIAL DATAPATH
-    // ----------------------------------------------------------------
     wire dout_next;
     assign dout_next = (int2_reg >= 32'sd0) ? 1'b1 : 1'b0;
 
@@ -93,18 +107,22 @@ module sd_dac (
                   (sum2_raw < ACC_MIN) ? ACC_MIN : sum2_raw;
 
     // ----------------------------------------------------------------
-    //  REGISTERED UPDATE — only on sdm_en
+    //  REGISTERED UPDATE
     // ----------------------------------------------------------------
-    always @(posedge clk) begin
-        if (rst) begin
-            int1_reg <= 32'sd0;
-            int2_reg <= 32'sd0;
-            dout     <= 1'b0;
-        end else if (sdm_en) begin
-            int1_reg <= sum1;
-            int2_reg <= sum2;
-            dout     <= dout_next;
+    generate
+        if (SELF_TEST == 0) begin
+            always @(posedge clk) begin
+                if (rst) begin
+                    int1_reg <= 32'sd0;
+                    int2_reg <= 32'sd0;
+                    dout     <= 1'b0;
+                end else if (sdm_en) begin
+                    int1_reg <= sum1;
+                    int2_reg <= sum2;
+                    dout     <= dout_next;
+                end
+            end
         end
-    end
+    endgenerate
 
 endmodule

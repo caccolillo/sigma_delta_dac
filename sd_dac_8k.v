@@ -1,187 +1,127 @@
 // =============================================================================
-// sd_dac.v
-// 2nd-Order CIFB Sigma-Delta DAC Modulator
-// Auto-generated parameters from DESIGN_SECOND_ORDER.m
-//
-// Interface:
-//   clk        : 100 MHz system clock
-//   rst        : active-high synchronous reset
-//   samp_valid : 8 kHz pulse — when high, din contains a new audio sample
-//   din        : 13-bit signed audio input (-4096 to +4095)
-//   dout       : 5 MHz PDM bitstream output → RC filter → audio
-//
-// Architecture:
-//   The modulator runs at 5 MHz (OSR=625 relative to 8 kHz audio).
-//   A clock enable divides the 100 MHz clk down to 5 MHz for the SDM.
-//   A new audio sample (din) is latched on samp_valid and held for
-//   625 SDM cycles until the next samp_valid pulse arrives.
-//
-// Coefficient word length : 18-bit  fixdt(1,18,N_FRAC)
-// Accumulator word length : 30-bit  fixdt(1,30,N_FRAC)
-// Fractional bits         : N_FRAC
-// Input shift             : 12  (= input_bits-1 = 13-1)
+// sd_dac.v — QSPICE compatible
+// Coefficients from DESIGN_SECOND_ORDER.m
+// Interface exactly as specified by user
 // =============================================================================
 
-module sd_dac #(
-    //------------------------------------------------------------------
-    // PASTE YOUR VALUES FROM DESIGN_SECOND_ORDER.m
-    // Section: --- COPY THESE PARAMETERS INTO VERILOG ---
-    //------------------------------------------------------------------
-    parameter signed [17:0] B1 = 18'sd25564,
-    parameter signed [17:0] A1 = 18'sd25564,
-    parameter signed [17:0] C1 = 18'sd437,
-    parameter signed [17:0] A2 = 18'sd610,
-
-    //------------------------------------------------------------------
-    // Word length parameters — must match DESIGN_SECOND_ORDER.m output
-    //------------------------------------------------------------------
-    parameter N_FRAC      = 13,    // fractional bits
-    parameter N_ACC       = 30,    // accumulator word length
-    parameter INPUT_SHIFT = 12,    // = input_bits-1
-
-    //------------------------------------------------------------------
-    // Clock divider: 100 MHz / CLK_DIV = 5 MHz SDM clock
-    // CLK_DIV = 100e6 / 5e6 = 20
-    //------------------------------------------------------------------
-    parameter CLK_DIV     = 20     // 100 MHz → 5 MHz
-)(
-    input  wire        clk,        // 100 MHz system clock
-    input  wire        rst,        // active-high synchronous reset
-    input  wire        samp_valid, // 8 kHz sample strobe
-    input  wire [12:0] din,        // 13-bit signed audio input
+module sd_dac (
+    input  wire        clk,        // 100 MHz
+    input  wire        rst,        // active high reset
+    input  wire        samp_valid, // 8 kHz sample valid
+    input  wire [12:0] din,        // 13-bit input sample
     output reg         dout        // 5 MHz PDM output
 );
 
     // ----------------------------------------------------------------
-    //  ACCUMULATOR SATURATION LIMITS
-    //  Must match acc_min/acc_max in DESIGN_SECOND_ORDER.m
+    //  COEFFICIENTS — paste integers from DESIGN_SECOND_ORDER.m
+    //  Section: --- COPY THESE PARAMETERS INTO VERILOG ---
     // ----------------------------------------------------------------
-    localparam signed [N_ACC-1:0] ACC_MAX =  (1 <<< (N_ACC-1)) - 1;
-    localparam signed [N_ACC-1:0] ACC_MIN = -(1 <<< (N_ACC-1));
+    localparam signed [31:0] B1 =  32'sd25564;
+    localparam signed [31:0] A1 =  32'sd25564;
+    localparam signed [31:0] C1 =  32'sd437;
+    localparam signed [31:0] A2 =  32'sd610;
 
     // ----------------------------------------------------------------
-    //  CLOCK DIVIDER — generates 5 MHz enable from 100 MHz clock
-    //  sdm_en is high for exactly one 100 MHz cycle every CLK_DIV cycles
-    //  All SDM logic is gated by sdm_en so it only updates at 5 MHz
+    //  CONSTANTS
     // ----------------------------------------------------------------
-    reg [$clog2(CLK_DIV)-1:0] clk_cnt;
-    wire                       sdm_en;
+    localparam signed [31:0] ACC_MAX     =  32'sd524287;  //  2^19 - 1
+    localparam signed [31:0] ACC_MIN     = -32'sd524288;  // -2^19
+    localparam        [31:0] INPUT_SHIFT = 32'd12;        // 13-bit input scale
+    localparam        [31:0] FRAC_SHIFT  = 32'd13;        // N_FRAC
+    localparam        [31:0] CLK_DIV     = 32'd20;        // 100MHz/20 = 5MHz
+
+    // ----------------------------------------------------------------
+    //  CLOCK DIVIDER — 100 MHz → 5 MHz enable
+    // ----------------------------------------------------------------
+    reg [31:0] clk_cnt;
+    wire       sdm_en;
+
+    assign sdm_en = (clk_cnt == CLK_DIV - 1);
 
     always @(posedge clk) begin
         if (rst) begin
-            clk_cnt <= 0;
+            clk_cnt <= 32'd0;
         end else begin
-            if (clk_cnt == CLK_DIV-1)
-                clk_cnt <= 0;
+            if (sdm_en)
+                clk_cnt <= 32'd0;
             else
-                clk_cnt <= clk_cnt + 1;
+                clk_cnt <= clk_cnt + 32'd1;
         end
     end
 
-    assign sdm_en = (clk_cnt == CLK_DIV-1);
-
     // ----------------------------------------------------------------
-    //  INPUT SAMPLE REGISTER
-    //  Latches din on samp_valid and holds it for all 625 SDM cycles
-    //  until the next samp_valid pulse arrives.
-    //  din is treated as signed 13-bit: sign-extend to N_ACC bits
+    //  INPUT LATCH
+    //  Sign-extend 13-bit din to 32-bit signed on samp_valid
     // ----------------------------------------------------------------
-    reg signed [N_ACC-1:0] u_reg;   // held audio sample, sign-extended
+    reg signed [31:0] u_reg;
 
     always @(posedge clk) begin
         if (rst) begin
-            u_reg <= 0;
+            u_reg <= 32'sd0;
         end else if (samp_valid) begin
-            // Sign-extend 13-bit signed input to N_ACC bits
-            u_reg <= {{(N_ACC-13){din[12]}}, din};
+            u_reg <= {{19{din[12]}}, din};
         end
     end
 
     // ----------------------------------------------------------------
-    //  INTEGRATOR STATE REGISTERS
+    //  INTEGRATOR REGISTERS — 32-bit signed covers 20-bit range
     // ----------------------------------------------------------------
-    reg signed [N_ACC-1:0] int1_reg;
-    reg signed [N_ACC-1:0] int2_reg;
+    reg signed [31:0] int1_reg;
+    reg signed [31:0] int2_reg;
 
     // ----------------------------------------------------------------
     //  COMBINATORIAL DATAPATH
-    //  All arithmetic is combinatorial — only the registers are clocked
-    //  This gives a clean single-cycle pipeline matching the block diagram
     // ----------------------------------------------------------------
 
-    //  Quantizer: invert MSB (sign bit) of int2_reg
-    //  int2_reg >= 0 → MSB=0 → dout=1  → feedback = +A1/+A2
-    //  int2_reg <  0 → MSB=1 → dout=0  → feedback = -A1/-A2
+    // Quantizer: sign bit of int2_reg
+    // int2 >= 0 → MSB=0 → dout_next=1 → feedback = +A1/+A2
+    // int2 <  0 → MSB=1 → dout_next=0 → feedback = -A1/-A2
     wire dout_next;
-    assign dout_next = ~int2_reg[N_ACC-1];
+    assign dout_next = ~int2_reg[31];
 
-    //  DAC feedback: 2:1 mux selecting +coeff or -coeff
-    //  No multiplier — just conditional sign flip
-    wire signed [N_ACC-1:0] fb_A1;
-    wire signed [N_ACC-1:0] fb_A2;
+    // DAC feedback: 2:1 mux — no multiplier needed
+    wire signed [31:0] fb_A1;
+    wire signed [31:0] fb_A2;
+    assign fb_A1 = dout_next ?  A1 : -A1;
+    assign fb_A2 = dout_next ?  A2 : -A2;
 
-    assign fb_A1 = dout_next ?
-        {{(N_ACC-18){A1[17]}}, A1} :
-        -{{(N_ACC-18){A1[17]}}, A1};
-
-    assign fb_A2 = dout_next ?
-        {{(N_ACC-18){A2[17]}}, A2} :
-        -{{(N_ACC-18){A2[17]}}, A2};
-
-    //  B1 × u_in:
-    //    B1   is Q(N_FRAC) — 18-bit coefficient
-    //    u_in is 13-bit raw integer scaled by 2^INPUT_SHIFT=2^12
-    //    Product is Q(N_FRAC+INPUT_SHIFT) = Q25
-    //    Right shift by INPUT_SHIFT=12 → Q(N_FRAC)=Q13
-    wire signed [N_ACC+INPUT_SHIFT-1:0] B1u_full;
-    wire signed [N_ACC-1:0]             B1u;
-
-    assign B1u_full = $signed(B1) * $signed(u_reg[INPUT_SHIFT+:13]);
+    // B1 x u_reg:
+    // B1   is Q13 (32-bit signed)
+    // u_reg is sign-extended 13-bit integer (scaled by 2^12)
+    // Product is 64-bit → shift right 12 → Q13
+    wire signed [63:0] B1u_full;
+    wire signed [31:0] B1u;
+    assign B1u_full = $signed(B1) * $signed(u_reg);
     assign B1u      = B1u_full >>> INPUT_SHIFT;
 
-    //  C1 × int1_reg:
-    //    C1       is Q(N_FRAC) — 18-bit
-    //    int1_reg is Q(N_FRAC) — N_ACC-bit accumulator
-    //    Product  is Q(2*N_FRAC) — (18+N_ACC)-bit
-    //    Right shift by N_FRAC → Q(N_FRAC)
-    wire signed [17+N_ACC:0] C1x_full;
-    wire signed [N_ACC-1:0]  C1x;
-
+    // C1 x int1_reg:
+    // Both Q13 → 64-bit product → shift right 13 → Q13
+    wire signed [63:0] C1x_full;
+    wire signed [31:0] C1x;
     assign C1x_full = $signed(C1) * $signed(int1_reg);
-    assign C1x      = C1x_full >>> N_FRAC;
+    assign C1x      = C1x_full >>> FRAC_SHIFT;
 
-    //  Integrator sums (before saturation)
-    wire signed [N_ACC-1:0] sum1_raw;
-    wire signed [N_ACC-1:0] sum2_raw;
+    // Integrator sums
+    wire signed [31:0] sum1_raw;
+    wire signed [31:0] sum2_raw;
+    assign sum1_raw = int1_reg + B1u - fb_A1;
+    assign sum2_raw = int2_reg + C1x - fb_A2;
 
-    assign sum1_raw = int1_reg + B1u  - fb_A1;
-    assign sum2_raw = int2_reg + C1x  - fb_A2;
-
-    //  Saturation function
-    function automatic signed [N_ACC-1:0] saturate;
-        input signed [N_ACC-1:0] x;
-        begin
-            if      (x > ACC_MAX)  saturate = ACC_MAX;
-            else if (x < ACC_MIN)  saturate = ACC_MIN;
-            else                   saturate = x;
-        end
-    endfunction
-
-    wire signed [N_ACC-1:0] sum1;
-    wire signed [N_ACC-1:0] sum2;
-
-    assign sum1 = saturate(sum1_raw);
-    assign sum2 = saturate(sum2_raw);
+    // Saturation — inline ternary, no automatic functions
+    wire signed [31:0] sum1;
+    wire signed [31:0] sum2;
+    assign sum1 = (sum1_raw > ACC_MAX) ? ACC_MAX :
+                  (sum1_raw < ACC_MIN) ? ACC_MIN : sum1_raw;
+    assign sum2 = (sum2_raw > ACC_MAX) ? ACC_MAX :
+                  (sum2_raw < ACC_MIN) ? ACC_MIN : sum2_raw;
 
     // ----------------------------------------------------------------
-    //  REGISTERED UPDATE — only on sdm_en (5 MHz gate)
-    //  Between sdm_en pulses all registers hold their values
-    //  dout is registered to prevent glitches on the output pin
+    //  REGISTERED UPDATE — gated by sdm_en (5 MHz)
     // ----------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
-            int1_reg <= 0;
-            int2_reg <= 0;
+            int1_reg <= 32'sd0;
+            int2_reg <= 32'sd0;
             dout     <= 1'b0;
         end else if (sdm_en) begin
             int1_reg <= sum1;

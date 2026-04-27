@@ -1,122 +1,84 @@
 // =============================================================================
-// sd_dac.v (v2 — fixed quantizer, explicit sign compare)
+// sine_gen.v — simple single-frequency sine generator
+// Generic FREQ_HZ sets the output frequency
+// Sample rate: 8 kHz (one sample every 12500 clocks at 100 MHz)
+// Output: 13-bit signed PCM (-2047 to +2047), centred on zero
 // =============================================================================
-module sd_dac (
+
+module sine_gen #(
+    parameter FREQ_HZ   = 1000,     // output frequency in Hz
+    parameter LUT_SIZE  = 256,      // sine LUT entries
+    parameter CLK_HZ    = 100000000,// system clock frequency
+    parameter SAMP_HZ   = 8000      // audio sample rate
+)(
     input  wire        clk,
     input  wire        rst,
-    input  wire        samp_valid,
-    input  wire [12:0] din,
-    output reg         dout
+    output reg  [12:0] sample,        // 13-bit signed PCM
+    output reg         sample_valid   // one clock pulse at SAMP_HZ rate
 );
 
-    localparam signed [31:0] B1 =  32'sd25564;
-    localparam signed [31:0] A1 =  32'sd25564;
-    localparam signed [31:0] C1 =  32'sd437;
-    localparam signed [31:0] A2 =  32'sd610;
+// =============================================================================
+//  SINE LUT — 256 entries, signed 13-bit, amplitude 2047
+// =============================================================================
+reg signed [12:0] sine_lut [0:LUT_SIZE-1];
+integer i;
+integer val;
+initial begin
+    for (i = 0; i < LUT_SIZE; i = i + 1) begin
+        val = $rtoi(2047.0 * $sin(2.0 * 3.14159265358979323846 * i / LUT_SIZE));
+        sine_lut[i] = val[12:0];
+    end
+end
 
-    localparam signed [31:0] ACC_MAX     =  32'sd524287;
-    localparam signed [31:0] ACC_MIN     = -32'sd524288;
-    localparam        [31:0] INPUT_SHIFT = 32'd12;
-    localparam        [31:0] FRAC_SHIFT  = 32'd13;
-    localparam        [31:0] CLK_DIV     = 32'd20;
+// =============================================================================
+//  8 kHz CLOCK DIVIDER
+//  100 MHz / 8 kHz = 12500 clocks per sample
+// =============================================================================
+localparam [31:0] DIV = CLK_HZ / SAMP_HZ;   // = 12500
 
-    // ----------------------------------------------------------------
-    //  CLOCK DIVIDER
-    // ----------------------------------------------------------------
-    reg [31:0] clk_cnt;
-    wire       sdm_en;
-    assign sdm_en = (clk_cnt == CLK_DIV - 1);
+reg [31:0] div_ctr;
 
-    always @(posedge clk) begin
-        if (rst) begin
-            clk_cnt <= 32'd0;
+always @(posedge clk) begin
+    if (rst) begin
+        div_ctr      <= 32'd0;
+        sample_valid <= 1'b0;
+    end else begin
+        if (div_ctr == DIV - 1) begin
+            div_ctr      <= 32'd0;
+            sample_valid <= 1'b1;
         end else begin
-            if (sdm_en)
-                clk_cnt <= 32'd0;
-            else
-                clk_cnt <= clk_cnt + 32'd1;
+            div_ctr      <= div_ctr + 32'd1;
+            sample_valid <= 1'b0;
         end
     end
+end
 
-    // ----------------------------------------------------------------
-    //  INPUT LATCH — sign extend 13-bit to 32-bit
-    // ----------------------------------------------------------------
-    reg signed [31:0] u_reg;
+// =============================================================================
+//  PHASE ACCUMULATOR
+//  phase_inc = LUT_SIZE * FREQ_HZ / SAMP_HZ
+//  Kept as a fixed integer — frequency resolution = SAMP_HZ / LUT_SIZE
+//  = 8000 / 256 = 31.25 Hz per LUT step
+//
+//  Examples at 8 kHz / 256-entry LUT:
+//    440  Hz : phase_inc = round(256 * 440  / 8000) = round(14.08) = 14
+//              actual    = 14 * 8000 / 256 = 437.5 Hz
+//    1000 Hz : phase_inc = round(256 * 1000 / 8000) = 32
+//              actual    = 32 * 8000 / 256 = 1000.0 Hz  (exact)
+//    3000 Hz : phase_inc = round(256 * 3000 / 8000) = 96
+//              actual    = 96 * 8000 / 256 = 3000.0 Hz  (exact)
+// =============================================================================
+localparam [7:0] PHASE_INC = (LUT_SIZE * FREQ_HZ + SAMP_HZ/2) / SAMP_HZ;
 
-    always @(posedge clk) begin
-        if (rst) begin
-            u_reg <= 32'sd0;
-        end else if (samp_valid) begin
-            // Explicit sign extension of 13-bit two's complement
-            // din[12] is the sign bit
-            if (din[12])
-                u_reg <= {19'h7FFFF, din};   // negative: fill upper bits with 1
-            else
-                u_reg <= {19'h00000, din};   // positive: fill upper bits with 0
-        end
+reg [7:0] phase;
+
+always @(posedge clk) begin
+    if (rst) begin
+        phase  <= 8'd0;
+        sample <= 13'd0;
+    end else if (sample_valid) begin
+        sample <= sine_lut[phase];
+        phase  <= phase + PHASE_INC;
     end
-
-    // ----------------------------------------------------------------
-    //  INTEGRATORS
-    // ----------------------------------------------------------------
-    reg signed [31:0] int1_reg;
-    reg signed [31:0] int2_reg;
-
-    // ----------------------------------------------------------------
-    //  QUANTIZER — explicit signed comparison, not bit check
-    // ----------------------------------------------------------------
-    wire dout_next;
-    assign dout_next = (int2_reg >= 32'sd0) ? 1'b1 : 1'b0;
-
-    // ----------------------------------------------------------------
-    //  DAC FEEDBACK
-    // ----------------------------------------------------------------
-    wire signed [31:0] fb_A1;
-    wire signed [31:0] fb_A2;
-    assign fb_A1 = dout_next ?  A1 : -A1;
-    assign fb_A2 = dout_next ?  A2 : -A2;
-
-    // ----------------------------------------------------------------
-    //  MULTIPLIERS
-    // ----------------------------------------------------------------
-    wire signed [63:0] B1u_full;
-    wire signed [31:0] B1u;
-    assign B1u_full = $signed(B1) * $signed(u_reg);
-    assign B1u      = B1u_full >>> INPUT_SHIFT;
-
-    wire signed [63:0] C1x_full;
-    wire signed [31:0] C1x;
-    assign C1x_full = $signed(C1) * $signed(int1_reg);
-    assign C1x      = C1x_full >>> FRAC_SHIFT;
-
-    // ----------------------------------------------------------------
-    //  INTEGRATOR SUMS + SATURATION
-    // ----------------------------------------------------------------
-    wire signed [31:0] sum1_raw;
-    wire signed [31:0] sum2_raw;
-    assign sum1_raw = int1_reg + B1u  - fb_A1;
-    assign sum2_raw = int2_reg + C1x  - fb_A2;
-
-    wire signed [31:0] sum1;
-    wire signed [31:0] sum2;
-    assign sum1 = (sum1_raw > ACC_MAX) ? ACC_MAX :
-                  (sum1_raw < ACC_MIN) ? ACC_MIN : sum1_raw;
-    assign sum2 = (sum2_raw > ACC_MAX) ? ACC_MAX :
-                  (sum2_raw < ACC_MIN) ? ACC_MIN : sum2_raw;
-
-    // ----------------------------------------------------------------
-    //  REGISTERED UPDATE — 5 MHz gate
-    // ----------------------------------------------------------------
-    always @(posedge clk) begin
-        if (rst) begin
-            int1_reg <= 32'sd0;
-            int2_reg <= 32'sd0;
-            dout     <= 1'b0;
-        end else if (sdm_en) begin
-            int1_reg <= sum1;
-            int2_reg <= sum2;
-            dout     <= dout_next;
-        end
-    end
+end
 
 endmodule

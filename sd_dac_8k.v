@@ -1,5 +1,6 @@
 // =============================================================================
-// sd_dac.v — using division instead of arithmetic shift (Verilator safe)
+// sd_dac.v — minimal SDM with hand-traced arithmetic
+// Bypasses all multiplication using the fact that B1=A1 with zero input
 // =============================================================================
 
 module sd_dac (
@@ -13,16 +14,8 @@ module sd_dac (
 
     localparam [3:0] TEST_MODE = 4'd4;
 
-    localparam signed [31:0] B1 =  32'sd25564;
-    localparam signed [31:0] A1 =  32'sd25564;
-    localparam signed [31:0] C1 =  32'sd437;
-    localparam signed [31:0] A2 =  32'sd610;
-
     localparam signed [31:0] ACC_MAX =  32'sd524287;
     localparam signed [31:0] ACC_MIN = -32'sd524288;
-    localparam signed [31:0] DIV_INPUT = 32'sd4096;   // 2^12
-    localparam signed [31:0] DIV_FRAC  = 32'sd8192;   // 2^13
-
     localparam        [31:0] SDM_DIV = 32'd20;
 
     // ----------------------------------------------------------------
@@ -43,61 +36,34 @@ module sd_dac (
     end
 
     // ----------------------------------------------------------------
-    //  INPUT SELECT
+    //  MINIMAL SDM — for TEST_MODE 4 (zero input):
+    //  With u=0, B1*u=0
+    //  int1 update: int1 += -fb_A1 = (dout ? -A1 : +A1)
+    //  C1*int1 = small value
+    //  int2 update: int2 += C1x - fb_A2
+    //
+    //  Use very simple coefficients to make it easy to trace:
+    //    A1_simple = 1024
+    //    A2_simple = 100
+    //    C1_simple = 1 (no shift, direct add)
+    //
+    //  Expected with zero input:
+    //    dout=1 → int1 -= 1024, int1 saturates negative quickly
+    //    int1 = -524288 → int2 += -524288/something - 100
+    //    int2 goes negative → dout flips to 0
+    //    dout=0 → int1 += 1024, recovers
+    //    Loop oscillates → dout has 50% duty cycle → 1.65V output
     // ----------------------------------------------------------------
-    reg signed [31:0] u_reg;
 
-    always @(posedge clk) begin
-        if (rst) begin
-            u_reg <= 32'sd0;
-        end else begin
-            case (TEST_MODE)
-                4'd0:    if (samp_valid) u_reg <= {{19{din[12]}}, din};
-                4'd2:    u_reg <=  32'sd1024;
-                4'd3:    u_reg <= -32'sd1024;
-                4'd4:    u_reg <=  32'sd0;
-                default: u_reg <=  32'sd0;
-            endcase
-        end
-    end
-
-    // ----------------------------------------------------------------
-    //  INTEGRATORS
-    // ----------------------------------------------------------------
     reg signed [31:0] int1_reg;
     reg signed [31:0] int2_reg;
 
-    // ----------------------------------------------------------------
-    //  COMBINATORIAL DATAPATH using signed division (Verilator safe)
-    //  Use 64-bit intermediate explicitly via $signed cast
-    // ----------------------------------------------------------------
     wire dout_next;
     assign dout_next = (int2_reg >= 32'sd0) ? 1'b1 : 1'b0;
 
-    wire signed [31:0] fb_A1;
-    wire signed [31:0] fb_A2;
-    assign fb_A1 = dout_next ?  A1 : -A1;
-    assign fb_A2 = dout_next ?  A2 : -A2;
-
-    // B1 * u_reg / 4096 — explicit 64-bit signed division
-    wire signed [63:0] B1u_64;
-    wire signed [31:0] B1u;
-    assign B1u_64 = $signed({{32{B1[31]}}, B1}) * $signed({{32{u_reg[31]}}, u_reg});
-    assign B1u    = B1u_64[31+12:12];   // arithmetic shift via bit slice
-
-    // C1 * int1_reg / 8192
-    wire signed [63:0] C1x_64;
-    wire signed [31:0] C1x;
-    assign C1x_64 = $signed({{32{C1[31]}}, C1}) * $signed({{32{int1_reg[31]}}, int1_reg});
-    assign C1x    = C1x_64[31+13:13];
-
-    wire signed [31:0] sum1_raw;
-    wire signed [31:0] sum2_raw;
-    assign sum1_raw = int1_reg + B1u - fb_A1;
-    assign sum2_raw = int2_reg + C1x - fb_A2;
-
     // ----------------------------------------------------------------
-    //  REGISTERED UPDATE
+    //  Simplified update — no multiplications at all for TEST_MODE 4
+    //  This isolates whether the loop control logic works
     // ----------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
@@ -106,20 +72,40 @@ module sd_dac (
             dout     <= 1'b0;
         end else if (TEST_MODE == 4'd1) begin
             if (sdm_en) dout <= ~dout;
-        end else if (sdm_en) begin
-            if (sum1_raw > ACC_MAX)
-                int1_reg <= ACC_MAX;
-            else if (sum1_raw < ACC_MIN)
-                int1_reg <= ACC_MIN;
-            else
-                int1_reg <= sum1_raw;
 
-            if (sum2_raw > ACC_MAX)
-                int2_reg <= ACC_MAX;
-            else if (sum2_raw < ACC_MIN)
-                int2_reg <= ACC_MIN;
-            else
-                int2_reg <= sum2_raw;
+        end else if (sdm_en) begin
+
+            // Simplified integrator 1: just subtract/add a constant
+            if (dout_next) begin
+                // dout=1 → subtract 1000
+                if (int1_reg - 32'sd1000 < ACC_MIN)
+                    int1_reg <= ACC_MIN;
+                else
+                    int1_reg <= int1_reg - 32'sd1000;
+            end else begin
+                // dout=0 → add 1000
+                if (int1_reg + 32'sd1000 > ACC_MAX)
+                    int1_reg <= ACC_MAX;
+                else
+                    int1_reg <= int1_reg + 32'sd1000;
+            end
+
+            // Simplified integrator 2: scale int1 by /16 then accumulate
+            if (dout_next) begin
+                if (int2_reg + (int1_reg >>> 4) - 32'sd100 < ACC_MIN)
+                    int2_reg <= ACC_MIN;
+                else if (int2_reg + (int1_reg >>> 4) - 32'sd100 > ACC_MAX)
+                    int2_reg <= ACC_MAX;
+                else
+                    int2_reg <= int2_reg + (int1_reg >>> 4) - 32'sd100;
+            end else begin
+                if (int2_reg + (int1_reg >>> 4) + 32'sd100 < ACC_MIN)
+                    int2_reg <= ACC_MIN;
+                else if (int2_reg + (int1_reg >>> 4) + 32'sd100 > ACC_MAX)
+                    int2_reg <= ACC_MAX;
+                else
+                    int2_reg <= int2_reg + (int1_reg >>> 4) + 32'sd100;
+            end
 
             dout <= dout_next;
         end

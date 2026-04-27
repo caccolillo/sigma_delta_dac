@@ -1,9 +1,5 @@
 // =============================================================================
-// sd_dac.v — full diagnostic version
-//   - Bare integer shift amounts (Verilator safe)
-//   - Inline saturation in always block
-//   - dbg_sdm_en debug output for QSPICE probing
-//   - TEST_MODE selector for diagnostics
+// sd_dac.v — using division instead of arithmetic shift (Verilator safe)
 // =============================================================================
 
 module sd_dac (
@@ -12,22 +8,11 @@ module sd_dac (
     input  wire        samp_valid,
     input  wire [12:0] din,
     output reg         dout,
-    output wire        dbg_sdm_en   // probe in QSPICE — should be 5 MHz pulse
+    output wire        dbg_sdm_en
 );
 
-    // ----------------------------------------------------------------
-    //  TEST MODE SELECT
-    //    0 = normal SDM operation (sine input via samp_valid + din)
-    //    1 = self-test: dout toggles at 5 MHz (50% duty)
-    //    2 = SDM with internal DC input = +1024
-    //    3 = SDM with internal DC input = -1024
-    //    4 = SDM with internal DC input = 0
-    // ----------------------------------------------------------------
     localparam [3:0] TEST_MODE = 4'd4;
 
-    // ----------------------------------------------------------------
-    //  COEFFICIENTS
-    // ----------------------------------------------------------------
     localparam signed [31:0] B1 =  32'sd25564;
     localparam signed [31:0] A1 =  32'sd25564;
     localparam signed [31:0] C1 =  32'sd437;
@@ -35,10 +20,13 @@ module sd_dac (
 
     localparam signed [31:0] ACC_MAX =  32'sd524287;
     localparam signed [31:0] ACC_MIN = -32'sd524288;
+    localparam signed [31:0] DIV_INPUT = 32'sd4096;   // 2^12
+    localparam signed [31:0] DIV_FRAC  = 32'sd8192;   // 2^13
+
     localparam        [31:0] SDM_DIV = 32'd20;
 
     // ----------------------------------------------------------------
-    //  CLOCK DIVIDER — 100 MHz → 5 MHz enable
+    //  CLOCK DIVIDER
     // ----------------------------------------------------------------
     reg [31:0] clk_cnt;
     wire       sdm_en;
@@ -55,7 +43,7 @@ module sd_dac (
     end
 
     // ----------------------------------------------------------------
-    //  INPUT SELECT — based on TEST_MODE
+    //  INPUT SELECT
     // ----------------------------------------------------------------
     reg signed [31:0] u_reg;
 
@@ -74,13 +62,14 @@ module sd_dac (
     end
 
     // ----------------------------------------------------------------
-    //  INTEGRATOR REGISTERS
+    //  INTEGRATORS
     // ----------------------------------------------------------------
     reg signed [31:0] int1_reg;
     reg signed [31:0] int2_reg;
 
     // ----------------------------------------------------------------
-    //  COMBINATORIAL DATAPATH — bare integer shift amounts
+    //  COMBINATORIAL DATAPATH using signed division (Verilator safe)
+    //  Use 64-bit intermediate explicitly via $signed cast
     // ----------------------------------------------------------------
     wire dout_next;
     assign dout_next = (int2_reg >= 32'sd0) ? 1'b1 : 1'b0;
@@ -90,15 +79,17 @@ module sd_dac (
     assign fb_A1 = dout_next ?  A1 : -A1;
     assign fb_A2 = dout_next ?  A2 : -A2;
 
-    wire signed [63:0] B1u_full;
+    // B1 * u_reg / 4096 — explicit 64-bit signed division
+    wire signed [63:0] B1u_64;
     wire signed [31:0] B1u;
-    assign B1u_full = $signed(B1) * $signed(u_reg);
-    assign B1u      = B1u_full >>> 12;
+    assign B1u_64 = $signed({{32{B1[31]}}, B1}) * $signed({{32{u_reg[31]}}, u_reg});
+    assign B1u    = B1u_64[31+12:12];   // arithmetic shift via bit slice
 
-    wire signed [63:0] C1x_full;
+    // C1 * int1_reg / 8192
+    wire signed [63:0] C1x_64;
     wire signed [31:0] C1x;
-    assign C1x_full = $signed(C1) * $signed(int1_reg);
-    assign C1x      = C1x_full >>> 13;
+    assign C1x_64 = $signed({{32{C1[31]}}, C1}) * $signed({{32{int1_reg[31]}}, int1_reg});
+    assign C1x    = C1x_64[31+13:13];
 
     wire signed [31:0] sum1_raw;
     wire signed [31:0] sum2_raw;
@@ -106,7 +97,7 @@ module sd_dac (
     assign sum2_raw = int2_reg + C1x - fb_A2;
 
     // ----------------------------------------------------------------
-    //  REGISTERED UPDATE — inline saturation, single always block
+    //  REGISTERED UPDATE
     // ----------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
@@ -114,11 +105,8 @@ module sd_dac (
             int2_reg <= 32'sd0;
             dout     <= 1'b0;
         end else if (TEST_MODE == 4'd1) begin
-            // Self-test: toggle dout at 5 MHz
-            if (sdm_en)
-                dout <= ~dout;
+            if (sdm_en) dout <= ~dout;
         end else if (sdm_en) begin
-            // Integrator 1 with inline saturation
             if (sum1_raw > ACC_MAX)
                 int1_reg <= ACC_MAX;
             else if (sum1_raw < ACC_MIN)
@@ -126,7 +114,6 @@ module sd_dac (
             else
                 int1_reg <= sum1_raw;
 
-            // Integrator 2 with inline saturation
             if (sum2_raw > ACC_MAX)
                 int2_reg <= ACC_MAX;
             else if (sum2_raw < ACC_MIN)
@@ -134,7 +121,6 @@ module sd_dac (
             else
                 int2_reg <= sum2_raw;
 
-            // Quantizer output
             dout <= dout_next;
         end
     end

@@ -1,5 +1,5 @@
 // =============================================================================
-// sd_dac.v — with built-in self-test to diagnose stuck output
+// sd_dac.v — diagnostic version with multiple test modes
 // =============================================================================
 
 module sd_dac (
@@ -11,12 +11,17 @@ module sd_dac (
 );
 
     // ----------------------------------------------------------------
-    //  SELF TEST — comment out after confirming dout toggles
-    //  Forces dout to toggle at 5 MHz regardless of SDM state
-    //  If dout still does not toggle, problem is in QSPICE wiring
-    //  not in the Verilog
+    //  TEST MODE SELECT
+    //    0 = normal SDM operation
+    //    1 = self-test: dout toggles at 5 MHz (50% duty)
+    //    2 = SDM with internal DC input = +1024 (positive constant)
+    //        Expected: dout duty cycle ~75% → output ~2.5V
+    //    3 = SDM with internal DC input = -1024 (negative constant)
+    //        Expected: dout duty cycle ~25% → output ~0.8V
+    //    4 = SDM with internal DC input = 0 (zero)
+    //        Expected: dout duty cycle ~50% → output ~1.65V
     // ----------------------------------------------------------------
-    localparam SELF_TEST = 0;   // set to 1 to enable, 0 to disable
+    localparam [3:0] TEST_MODE = 4'd2;   // change this to test
 
     localparam signed [31:0] B1 =  32'sd25564;
     localparam signed [31:0] A1 =  32'sd25564;
@@ -44,30 +49,22 @@ module sd_dac (
     end
 
     // ----------------------------------------------------------------
-    //  SELF TEST OUTPUT — toggle dout at 5 MHz
-    //  Use this to verify QSPICE wiring before testing SDM
-    // ----------------------------------------------------------------
-    generate
-        if (SELF_TEST == 1) begin
-            always @(posedge clk) begin
-                if (rst)
-                    dout <= 1'b0;
-                else if (sdm_en)
-                    dout <= ~dout;
-            end
-        end
-    endgenerate
-
-    // ----------------------------------------------------------------
-    //  INPUT LATCH
+    //  INPUT SELECT — based on TEST_MODE
     // ----------------------------------------------------------------
     reg signed [31:0] u_reg;
 
     always @(posedge clk) begin
-        if (rst)
+        if (rst) begin
             u_reg <= 32'sd0;
-        else if (samp_valid)
-            u_reg <= {{19{din[12]}}, din};
+        end else begin
+            case (TEST_MODE)
+                4'd0: if (samp_valid) u_reg <= {{19{din[12]}}, din};
+                4'd2: u_reg <= 32'sd1024;     // positive DC
+                4'd3: u_reg <= -32'sd1024;    // negative DC
+                4'd4: u_reg <= 32'sd0;        // zero
+                default: u_reg <= 32'sd0;
+            endcase
+        end
     end
 
     // ----------------------------------------------------------------
@@ -109,20 +106,19 @@ module sd_dac (
     // ----------------------------------------------------------------
     //  REGISTERED UPDATE
     // ----------------------------------------------------------------
-    generate
-        if (SELF_TEST == 0) begin
-            always @(posedge clk) begin
-                if (rst) begin
-                    int1_reg <= 32'sd0;
-                    int2_reg <= 32'sd0;
-                    dout     <= 1'b0;
-                end else if (sdm_en) begin
-                    int1_reg <= sum1;
-                    int2_reg <= sum2;
-                    dout     <= dout_next;
-                end
-            end
+    always @(posedge clk) begin
+        if (rst) begin
+            int1_reg <= 32'sd0;
+            int2_reg <= 32'sd0;
+            dout     <= 1'b0;
+        end else if (TEST_MODE == 4'd1) begin
+            // Self-test toggle
+            if (sdm_en) dout <= ~dout;
+        end else if (sdm_en) begin
+            int1_reg <= sum1;
+            int2_reg <= sum2;
+            dout     <= dout_next;
         end
-    endgenerate
+    end
 
 endmodule

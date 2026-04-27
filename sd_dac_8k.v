@@ -1,3 +1,7 @@
+// =============================================================================
+// sd_dac.v — working version with fixed clock divider
+// =============================================================================
+
 module sd_dac (
     input  wire        clk,
     input  wire        rst,
@@ -7,37 +11,111 @@ module sd_dac (
     output wire        dbg_sdm_en
 );
 
+    localparam [3:0] TEST_MODE = 4'd0;   // 0=normal, 4=zero-input test
+
+    localparam signed [31:0] B1 =  32'sd25564;
+    localparam signed [31:0] A1 =  32'sd25564;
+    localparam signed [31:0] C1 =  32'sd437;
+    localparam signed [31:0] A2 =  32'sd610;
+
     localparam signed [31:0] ACC_MAX =  32'sd524287;
     localparam signed [31:0] ACC_MIN = -32'sd524288;
 
-    assign dbg_sdm_en = 1'b1;
+    // ----------------------------------------------------------------
+    //  CLOCK DIVIDER — explicit count to 19 (20 cycles total)
+    //  100 MHz / 20 = 5 MHz
+    // ----------------------------------------------------------------
+    reg [4:0] clk_cnt;       // 5-bit counter, counts 0 to 19
+    reg       sdm_en_reg;    // registered enable
 
+    always @(posedge clk) begin
+        if (rst) begin
+            clk_cnt    <= 5'd0;
+            sdm_en_reg <= 1'b0;
+        end else begin
+            if (clk_cnt == 5'd19) begin
+                clk_cnt    <= 5'd0;
+                sdm_en_reg <= 1'b1;     // assert for one cycle
+            end else begin
+                clk_cnt    <= clk_cnt + 5'd1;
+                sdm_en_reg <= 1'b0;
+            end
+        end
+    end
+
+    wire sdm_en = sdm_en_reg;
+    assign dbg_sdm_en = sdm_en;
+
+    // ----------------------------------------------------------------
+    //  INPUT SELECT
+    // ----------------------------------------------------------------
+    reg signed [31:0] u_reg;
+
+    always @(posedge clk) begin
+        if (rst) begin
+            u_reg <= 32'sd0;
+        end else begin
+            case (TEST_MODE)
+                4'd0:    if (samp_valid) u_reg <= {{19{din[12]}}, din};
+                4'd2:    u_reg <=  32'sd1024;
+                4'd3:    u_reg <= -32'sd1024;
+                4'd4:    u_reg <=  32'sd0;
+                default: u_reg <=  32'sd0;
+            endcase
+        end
+    end
+
+    // ----------------------------------------------------------------
+    //  INTEGRATORS
+    // ----------------------------------------------------------------
     reg signed [31:0] int1_reg;
     reg signed [31:0] int2_reg;
 
     wire dout_next;
     assign dout_next = (int2_reg >= 32'sd0) ? 1'b1 : 1'b0;
 
+    wire signed [31:0] fb_A1;
+    wire signed [31:0] fb_A2;
+    assign fb_A1 = dout_next ?  A1 : -A1;
+    assign fb_A2 = dout_next ?  A2 : -A2;
+
+    wire signed [63:0] B1u_64;
+    wire signed [31:0] B1u;
+    assign B1u_64 = $signed(B1) * $signed(u_reg);
+    assign B1u    = B1u_64[43:12];
+
+    wire signed [63:0] C1x_64;
+    wire signed [31:0] C1x;
+    assign C1x_64 = $signed(C1) * $signed(int1_reg);
+    assign C1x    = C1x_64[44:13];
+
+    wire signed [31:0] sum1_raw;
+    wire signed [31:0] sum2_raw;
+    assign sum1_raw = int1_reg + B1u - fb_A1;
+    assign sum2_raw = int2_reg + C1x - fb_A2;
+
+    // ----------------------------------------------------------------
+    //  REGISTERED UPDATE
+    // ----------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
             int1_reg <= 32'sd0;
             int2_reg <= 32'sd0;
             dout     <= 1'b0;
-        end else begin
-
-            // Integrator 1: with zero input,
-            //   dout=1 → int1 -= 1000
-            //   dout=0 → int1 += 1000
-            if (dout_next)
-                int1_reg <= (int1_reg - 32'sd1000 < ACC_MIN) ? ACC_MIN : int1_reg - 32'sd1000;
+        end else if (sdm_en) begin
+            if (sum1_raw > ACC_MAX)
+                int1_reg <= ACC_MAX;
+            else if (sum1_raw < ACC_MIN)
+                int1_reg <= ACC_MIN;
             else
-                int1_reg <= (int1_reg + 32'sd1000 > ACC_MAX) ? ACC_MAX : int1_reg + 32'sd1000;
+                int1_reg <= sum1_raw;
 
-            // Integrator 2: int1/16 + feedback
-            if (dout_next)
-                int2_reg <= int2_reg + (int1_reg >>> 4) - 32'sd100;
+            if (sum2_raw > ACC_MAX)
+                int2_reg <= ACC_MAX;
+            else if (sum2_raw < ACC_MIN)
+                int2_reg <= ACC_MIN;
             else
-                int2_reg <= int2_reg + (int1_reg >>> 4) + 32'sd100;
+                int2_reg <= sum2_raw;
 
             dout <= dout_next;
         end

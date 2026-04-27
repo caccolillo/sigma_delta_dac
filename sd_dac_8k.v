@@ -1,183 +1,103 @@
 // =============================================================================
 // sigma_delta_headset_test.v
-// Top-level for QSPICE — contains sine generator + sigma-delta DAC integrated
-//
-// Ports match QSPICE schematic:
-//   clk     : 100 MHz clock from V3
-//   rst     : active-high reset from V9
-//   out_bit : 1-bit PDM output → E1 controlled voltage source → RC filter
-//
-// Internal:
-//   - sine_gen produces 13-bit signed audio at 8 kHz sample rate
-//   - sd_dac modulates to 1-bit PDM at 5 MHz (OSR=625)
-//   - All wiring done inside Verilog — no QSPICE intermediate signals
+// SINGLE module — sine generator and SDM in the same always block hierarchy
+// No inter-module wiring, no separate samp_valid path
 // =============================================================================
 
 module sigma_delta_headset_test (
     input  wire clk,        // 100 MHz
     input  wire rst,        // active-high reset
-    output wire out_bit     // PDM output to E1
+    output reg  out_bit     // PDM output to E1
 );
 
     // ----------------------------------------------------------------
-    //  INTERNAL WIRING between sine_gen and sd_dac
+    //  COEFFICIENTS — Q13 fixed-point
     // ----------------------------------------------------------------
-    wire [12:0] din_internal;
-    wire        samp_valid_internal;
-
-    // ----------------------------------------------------------------
-    //  SINE GENERATOR — 1 kHz at 8 kHz sample rate
-    // ----------------------------------------------------------------
-    sine_gen u_sine (
-        .clk          (clk),
-        .rst          (rst),
-        .sample       (din_internal),
-        .sample_valid (samp_valid_internal)
-    );
-
-    // ----------------------------------------------------------------
-    //  SIGMA-DELTA DAC
-    // ----------------------------------------------------------------
-    sd_dac u_dac (
-        .clk        (clk),
-        .rst        (rst),
-        .samp_valid (samp_valid_internal),
-        .din        (din_internal),
-        .dout       (out_bit)
-    );
-
-endmodule
-
-
-// =============================================================================
-// sine_gen — 1 kHz signed sine at 8 kHz sample rate
-//   Output: 13-bit two's complement, range -2047..+2047
-//   Uses hardcoded 8-entry LUT (no $sin/$rtoi for Verilator robustness)
-//   8 samples × 8 kHz / 8 = 1000 Hz output frequency
-// =============================================================================
-module sine_gen (
-    input  wire        clk,
-    input  wire        rst,
-    output reg  [12:0] sample,
-    output reg         sample_valid
-);
-
-    // ----------------------------------------------------------------
-    //  Hardcoded 8-entry sine LUT, 13-bit signed, amplitude 2047
-    //  i=0:  0
-    //  i=1: +1448
-    //  i=2: +2047
-    //  i=3: +1448
-    //  i=4:  0
-    //  i=5: -1448
-    //  i=6: -2047
-    //  i=7: -1448
-    //  Stored as 13-bit two's complement
-    // ----------------------------------------------------------------
-    reg signed [12:0] lut [0:7];
-    initial begin
-        lut[0] =  13'sd0;
-        lut[1] =  13'sd1448;
-        lut[2] =  13'sd2047;
-        lut[3] =  13'sd1448;
-        lut[4] =  13'sd0;
-        lut[5] = -13'sd1448;
-        lut[6] = -13'sd2047;
-        lut[7] = -13'sd1448;
-    end
-
-    // ----------------------------------------------------------------
-    //  8 kHz sample tick: 100 MHz / 8 kHz = 12500 clocks
-    // ----------------------------------------------------------------
-    reg [13:0] div_cnt;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            div_cnt      <= 14'd0;
-            sample_valid <= 1'b0;
-        end else begin
-            if (div_cnt == 14'd12499) begin
-                div_cnt      <= 14'd0;
-                sample_valid <= 1'b1;
-            end else begin
-                div_cnt      <= div_cnt + 14'd1;
-                sample_valid <= 1'b0;
-            end
-        end
-    end
-
-    // ----------------------------------------------------------------
-    //  LUT phase advancer
-    // ----------------------------------------------------------------
-    reg [2:0] phase;
-
-    always @(posedge clk) begin
-        if (rst) begin
-            phase  <= 3'd0;
-            sample <= 13'sd0;
-        end else if (sample_valid) begin
-            sample <= lut[phase];
-            phase  <= phase + 3'd1;
-        end
-    end
-
-endmodule
-
-
-// =============================================================================
-// sd_dac — 2nd order CIFB sigma-delta modulator
-//   100 MHz clk → 5 MHz SDM rate (CLK_DIV=20)
-//   13-bit signed input, 1-bit PDM output
-//   Coefficients from Delta-Sigma Toolbox, Q13 fixed-point
-// =============================================================================
-module sd_dac (
-    input  wire        clk,
-    input  wire        rst,
-    input  wire        samp_valid,
-    input  wire [12:0] din,
-    output reg         dout
-);
-
     localparam signed [31:0] B1 =  32'sd25564;
     localparam signed [31:0] A1 =  32'sd25564;
     localparam signed [31:0] C1 =  32'sd437;
     localparam signed [31:0] A2 =  32'sd610;
-
     localparam signed [31:0] ACC_MAX =  32'sd524287;
     localparam signed [31:0] ACC_MIN = -32'sd524288;
 
     // ----------------------------------------------------------------
-    //  CLOCK DIVIDER — 100 MHz → 5 MHz enable
+    //  INTERNAL 8-ENTRY SINE LUT — 1 kHz at 8 kHz sample rate
+    //  amplitude reduced to 1024 for safety margin
     // ----------------------------------------------------------------
-    reg [4:0] clk_cnt;
-    reg       sdm_en;
+    reg signed [31:0] sine_val;
+
+    always @(*) begin
+        case (sine_phase)
+            3'd0: sine_val =  32'sd0;
+            3'd1: sine_val =  32'sd724;
+            3'd2: sine_val =  32'sd1024;
+            3'd3: sine_val =  32'sd724;
+            3'd4: sine_val =  32'sd0;
+            3'd5: sine_val = -32'sd724;
+            3'd6: sine_val = -32'sd1024;
+            3'd7: sine_val = -32'sd724;
+            default: sine_val = 32'sd0;
+        endcase
+    end
+
+    // ----------------------------------------------------------------
+    //  TIMING — 8 kHz sample tick (every 12500 clocks)
+    //          5 MHz SDM tick (every 20 clocks)
+    // ----------------------------------------------------------------
+    reg [13:0] samp_div;
+    reg [4:0]  sdm_div;
+    reg        samp_tick;
+    reg        sdm_tick;
 
     always @(posedge clk) begin
         if (rst) begin
-            clk_cnt <= 5'd0;
-            sdm_en  <= 1'b0;
+            samp_div  <= 14'd0;
+            samp_tick <= 1'b0;
         end else begin
-            if (clk_cnt == 5'd19) begin
-                clk_cnt <= 5'd0;
-                sdm_en  <= 1'b1;
+            if (samp_div == 14'd12499) begin
+                samp_div  <= 14'd0;
+                samp_tick <= 1'b1;
             end else begin
-                clk_cnt <= clk_cnt + 5'd1;
-                sdm_en  <= 1'b0;
+                samp_div  <= samp_div + 14'd1;
+                samp_tick <= 1'b0;
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (rst) begin
+            sdm_div  <= 5'd0;
+            sdm_tick <= 1'b0;
+        end else begin
+            if (sdm_div == 5'd19) begin
+                sdm_div  <= 5'd0;
+                sdm_tick <= 1'b1;
+            end else begin
+                sdm_div  <= sdm_div + 5'd1;
+                sdm_tick <= 1'b0;
             end
         end
     end
 
     // ----------------------------------------------------------------
-    //  INPUT LATCH on samp_valid
+    //  SINE PHASE ADVANCER — increments at 8 kHz
     // ----------------------------------------------------------------
-    reg signed [31:0] u_reg;
+    reg [2:0] sine_phase;
 
     always @(posedge clk) begin
         if (rst)
-            u_reg <= 32'sd0;
-        else if (samp_valid)
-            u_reg <= {{19{din[12]}}, din};
+            sine_phase <= 3'd0;
+        else if (samp_tick)
+            sine_phase <= sine_phase + 3'd1;
     end
+
+    // ----------------------------------------------------------------
+    //  INPUT TO SDM — sine_val is already 32-bit signed
+    //  No latch needed since sine_val is held stable between samp_ticks
+    //  by the combinatorial case statement on sine_phase
+    // ----------------------------------------------------------------
+    wire signed [31:0] u_reg;
+    assign u_reg = sine_val;
 
     // ----------------------------------------------------------------
     //  INTEGRATORS
@@ -209,14 +129,14 @@ module sd_dac (
     assign sum2_raw = int2_reg + C1x - fb_A2;
 
     // ----------------------------------------------------------------
-    //  REGISTERED UPDATE
+    //  REGISTERED UPDATE — at 5 MHz SDM rate
     // ----------------------------------------------------------------
     always @(posedge clk) begin
         if (rst) begin
             int1_reg <= 32'sd0;
             int2_reg <= 32'sd0;
-            dout     <= 1'b0;
-        end else if (sdm_en) begin
+            out_bit  <= 1'b0;
+        end else if (sdm_tick) begin
             if (sum1_raw > ACC_MAX)
                 int1_reg <= ACC_MAX;
             else if (sum1_raw < ACC_MIN)
@@ -231,7 +151,7 @@ module sd_dac (
             else
                 int2_reg <= sum2_raw;
 
-            dout <= dout_next;
+            out_bit <= dout_next;
         end
     end
 

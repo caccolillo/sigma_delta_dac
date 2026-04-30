@@ -8,7 +8,7 @@
 
 #include <ap_int.h>
 
-// 13-bit signed audio input
+// 13-bit signed audio input (range -4096 to +4095)
 typedef ap_int<13> input_t;
 
 // Single-bit PDM output

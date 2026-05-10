@@ -12,7 +12,7 @@
 
 # Project setup
 open_project -reset sdm_hls_project
-set_top sdm_cifb_trd
+set_top sdm_cifb_3rd
 
 # Source files
 add_files sdm_cifb_3rd.cpp -cflags "-std=c++14"
